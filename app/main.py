@@ -1,324 +1,876 @@
 import asyncio
-import socket  # noqa: F401
-import struct
-import sys
-from .metadata import Metadata
-
-ERRORS = {
-    "ok": int(0).to_bytes(2, byteorder="big"),
-    "error": int(35).to_bytes(2, byteorder="big"),
+import json
+import socket
+import uuid
+from abc import ABC, abstractmethod
+from enum import Enum
+from os import path
+from struct import pack, unpack, calcsize
+from typing import BinaryIO, Any
+error_codes = {"NONE": 0, "UNKNOWN_TOPIC_OR_PARTITION": 3, "UNSUPPORTED_VERSION": 35}
+supported_api_version = list(range(5))
+supported_API_keys = {
+    1: {"name": "Fetch", "min": 0, "max": 16},
+    18: {"name": "APIVersions", "min": 0, "max": 4},
+    75: {"name": "DescribeTopicPartitions", "min": 0, "max": 0},
 }
-TAG_BUFFER = int(0).to_bytes(1, byteorder="big")
-DEFAULT_THROTTLE_TIME = int(0).to_bytes(4, byteorder="big")
-
-class BaseKafka(object):
+min_version, max_version = 0, 4
+tag_buffer = 0
+throttle_time_ms = 0
+port = 9092
+sizes = {}
+path_to_logs = "/tmp/kraft-combined-logs/__cluster_metadata-0/"
+log_file = "00000000000000000000.log"
+DEBUG = False
+class BaseBinaryHandler(ABC):
+    """Abstract class for handling incoming data"""
+    @abstractmethod
+    async def prepare_response_body(parsed_request: bytes) -> dict:
+        pass
+class Utilities:
     @staticmethod
-    def _create_message(message: bytes):
-        message_size = len(message)
-        message_bytes = message_size.to_bytes(4, byteorder="big")
-        return message_bytes + message
-
-    @staticmethod
-    def _remove_tag_buffer(buffer: bytes):
-        return buffer[1:]
-
-    @staticmethod
-    def _parse_string(buffer: bytes):
-        length = int.from_bytes(buffer[:2], byteorder="big")
-        string = buffer[2 : 2 + length].decode("utf-8")
-        return (string, buffer[2 + length :])
-
-    @staticmethod
-    def _parse_array(buffer: bytes, func):
-        arr_length = int.from_bytes(buffer[:1], byteorder="big") - 1
-        arr_buffer = buffer[1:]
-        for _ in range(arr_length):
-            item_length = int.from_bytes(arr_buffer[:1], byteorder="big")
-            item_buffer = arr_buffer[1:item_length]
-            func(item_buffer)
-            arr_buffer = arr_buffer[item_length + 1 :]
-        return arr_buffer
-
-class KafkaHeader(BaseKafka):
-    def __init__(self, data: bytes):
-        self.length = data[0:4]
-        self.key = data[4:6]
-        self.key_int = int.from_bytes(self.key, byteorder="big")
-        self.version = data[6:8]
-        self.version_int = int.from_bytes(self.version, byteorder="big")
-        self.id = data[8:12]
-        self.client, buffer = self._parse_string(data[12:])
-        buffer = self._remove_tag_buffer(buffer)
-        self.body = buffer
-
-class ApiRequest(BaseKafka):
-    # The class "constructor" - It's actually an initializer
-    def __init__(self, version_int: int, id: bytes):
-        self.version_int = version_int
-        self.id = id
-        self.message = self._create_message(self.construct_message())
-
-    def add_api_version(self, string, api_version, mini, maximum):
-        string += api_version
-        string += int(mini).to_bytes(2)
-        string += int(maximum).to_bytes(2)
-        return string
-
-    def construct_message(self):
-        body = self.id
-        body += self.error_handler()
-        apis = b""
-        apis += struct.pack(">b", 3)
-        apis += struct.pack(">hhhb", 18, 4, 18, 0)
-        apis += struct.pack(">hhhb", 75, 0, 0, 0)
-        body += apis
-        body += struct.pack(">Ib", 4, 0)
-        return body
-
-    def error_handler(self):
-        if 0 <= self.version_int <= 4:
-            return ERRORS["ok"]
-        else:
-            return ERRORS["error"]
-
-class TopicRequest(BaseKafka):
-    # The class "constructor" - It's actually an initializer
-    def __init__(self, correlation_id, body, metadata):
-        self.id = correlation_id
-        self.body = body
-        self.topics = []
-        buffer = self._parse_array(body, self.parse_topics)
-        self.limit = buffer[0:4]
-        self.cursor = buffer[4:5]
-        self.available_topics = metadata.topics
-        self.partitions = metadata.partitions
-        self.message = self._create_message(self.construct_message())
-
-    def parse_topics(self, item_buffer):
-        decoded_topic = item_buffer.decode("utf-8")
-        self.topics.append(decoded_topic)
-
-    def add_api_version(self, string, api_version, mini, maximum):
-        string += api_version
-        string += int(mini).to_bytes(2)
-        string += int(maximum).to_bytes(2)
-        return string
-
-    def create_topic_item(self, topic):
-        available = topic in self.available_topics
-        topic_buffer = b""
-        # two byte error code
-        if available:
-            topic_buffer += struct.pack(">h", 0)
-        else:
-            topic_buffer += struct.pack(">h", 3)
-        # string length
-        topic_buffer += struct.pack(">b", len(topic) + 1)
-        # encode string
-        topic_buffer += struct.pack(f">{len(topic)}s", topic)
-        # topic id
-        uuid_str = self.available_topics[topic]["uuid"]
-        # Convert to a UUID object and then to bytes
-        uuid_bytes = uuid_str.bytes
-        # Pack the 16-byte binary UUID
-        topic_buffer += struct.pack("16s", uuid_bytes)
-        # is internal false
-        topic_buffer += struct.pack(">b", 0)
-        # empty partition array
-        topic_buffer += struct.pack(
-            ">b", len(self.available_topics[topic]["partitions"]) + 1
+    def display(data_dict: dict, msg: str) -> None:
+        print(
+            f"===============================BEGINNING OF {msg} ====================================="
         )
-        if available:
-            print(self.available_topics[topic])
-            for id in self.available_topics[topic]["partitions"]:
-                print(self.partitions[id])
-                topic_buffer += self.add_partition(self.partitions[id])
-        # permissions
-        topic_buffer += struct.pack(">I", 0x00000DF8)
-        # tag buffer
-        topic_buffer += struct.pack(">b", 0)
-        return topic_buffer
-
-    def add_partition(self, partition):
-        ret = b""
-        # error code
-        ret += struct.pack(">h", 0)
-        # index
-        ret += struct.pack(">I", int.from_bytes(partition["id"]))
-        # leader
-        ret += struct.pack(">I", int.from_bytes(partition["leader"]))
-        # leader_epoch
-        ret += struct.pack(">I", int.from_bytes(partition["leader_epoch"]))
-        ret += struct.pack(">b", 0)
-        ret += struct.pack(">b", 0)
-        ret += struct.pack(">b", 0)
-        ret += struct.pack(">b", 0)
-        ret += struct.pack(">b", 0)
-        ret += struct.pack(">b", 0)
-        return ret
-
-    def construct_message(self):
-        header = self.id
-        header += TAG_BUFFER
-        # array length
-        topics_buffer = int(len(self.topics) + 1).to_bytes(1)
-        # encode topic
-        topics_buffer += self.create_topic_item(self.topics[0].encode("utf-8"))
-        topics_buffer += struct.pack(">B", 0xFF)
-        topics_buffer += struct.pack(">b", 0)
-        return header + DEFAULT_THROTTLE_TIME + topics_buffer
-
-    def error_handler(self):
-        version = int.from_bytes(self.version, byteorder="big")
-        if 0 <= version <= 4:
-            return ERRORS["ok"]
+        print(
+            json.dumps(
+                data_dict,
+                indent=4,
+            )
+        )
+        print(
+            f"===============================END OF {msg} ====================================="
+        )
+    @staticmethod
+    def check_api_version(request_api_version):
+        return (
+            error_codes["NONE"]
+            if request_api_version in supported_api_version
+            else error_codes["UNSUPPORTED_VERSION"]
+        )
+    @staticmethod
+    def unpack_helper(format, data):
+        size = calcsize(format)
+        return unpack(format, data[:size]), data[size:]
+    @staticmethod
+    def stringify(list_of_ascii_codes: tuple) -> str:
+        return "".join(chr(c) for c in list_of_ascii_codes)
+    @staticmethod
+    def decode_zigzag_to_signed(n: int) -> int:
+        return (n >> 1) - (n & 1) * n
+    @staticmethod
+    def test_msb(b: bytes) -> bool:
+        int_b = int.from_bytes(b)
+        if int_b >= 64:
+            return True
         else:
-            return ERRORS["error"]
-
-
-class DescribeTopicPartitionsRequest(BaseKafka):
-    def __init__(self, correlation_id, body, metadata):
-        self.id = correlation_id
-        self.body = body
-        self.topics = []
-        buffer = self._parse_array(body, self.parse_topics)
-        self.cursor = buffer[0:1]  # Extract cursor
-        buffer = self._remove_tag_buffer(buffer)
-        self.available_topics = metadata.topics
-        self.partitions = metadata.partitions
-        self.message = self._create_message(self.construct_message())
-
-    def parse_topics(self, item_buffer):
-        self.topics.append(item_buffer.decode("utf-8"))
-
-    def create_topic_item(self, topic):
-        available = topic in self.available_topics
-        topic_buffer = b""
-        # two byte error code
-        if available:
-            topic_buffer += struct.pack(">h", 0)  # Success
+            return False
+    @staticmethod
+    def read_varint(f: BinaryIO, signed: bool = True) -> int:
+        """VARINT processing
+        Args:
+            f (BinaryIO): file descriptor
+            signed (bool, optional): whether the varint is signed or not. Defaults to True.
+        Returns:
+            int: the signed or unsigned varint
+        """
+        val = ""
+        while True:
+            b = f.read(MetadataLogFile.R_KEY_LENGTH.value)
+            num = bin(int.from_bytes(b))[2:].zfill(8)
+            val = num[1:] + val
+            if Utilities.test_msb(b) is False:
+                break
+        # SIGNED -> zigzag processing / UNSIGNED -> just the int convertion
+        val = Utilities.decode_zigzag_to_signed(int(val, 2)) if signed else int(val, 2)
+        return val
+class MetadataLogFile(Enum):
+    BASE_OFFSET_SIZE = 8
+    BATCH_LENGTH_SIZE = 4
+    PARTITION_LEADER_EPOCH = 4
+    MAGIC_BYTE = 1
+    CRC = 4
+    ATTRIBUTES = 2
+    LAST_OFFSET_DELTA = 4
+    BASE_TIMESTAMP = 8
+    MAX_TIMESTAMP = 8
+    PRODUCER_ID = 8
+    PRODUCER_EPOCH = 2
+    BASE_SEQUENCE = 4
+    RECORDS_LENGTH = 4
+    # indivudual record constants :
+    R_LENGTH = 1  # VARINT
+    R_ATTRIBUTES = 1
+    R_TIMESTAMP_DELTA = 1
+    R_OFFSET_DELTA = 1
+    R_KEY_LENGTH = 1
+    R_VALUE_LENGTH = 1
+    # Value in record constants
+    R_V_FRAME_VERSION = 1
+    R_V_TYPE = 1
+    R_V_VERSION = 1
+    R_V_NAME_LENGTH = 1
+    R_V_FEATURE_LEVEL = 2
+    R_V_TAGGED_FIELDS_COUNTS = 1
+    R_V_TOPIC_UUID = 16
+    R_V_PARTITION_ID = 4
+    R_V_LENGTH_OF_REPLICA_ARRAY = 1
+    R_V_REPLICA_ARRAY = 4
+    R_HEADERS_ARRAY_COUNT = 1
+class MetaDataLog:
+    def __init__(self, file_name):
+        self.file_name = file_name
+        self.log = {}
+        self.parse_common_structure()
+    def parse_common_structure(self) -> None:
+        """
+        Parse path_to_logs + self.file_name binary file and fill the self.log dictionnary with the info retrieved.
+        """
+        with open(path_to_logs + self.file_name, "rb") as f:
+            if DEBUG:
+                print(f"----file {self.file_name} content : {f.read().hex(':')}---")
+            f.seek(0, 2)
+            file_size = f.tell() - 1
+            f.seek(0)
+            if DEBUG:
+                print(f"File size : {file_size}")
+            Record_Batch = 1
+            while f.tell() < file_size:
+                if DEBUG:
+                    print(f"File position begining of new batch : {f.tell()}")
+                self.log[f"Record Batch #{Record_Batch}"] = {}
+                self.log[f"Record Batch #{Record_Batch}"]["Base Offset"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.BASE_OFFSET_SIZE.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Batch Length"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.BATCH_LENGTH_SIZE.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Partition Leader Epoch"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.PARTITION_LEADER_EPOCH.value),
+                        byteorder="big",
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Magic Byte"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.MAGIC_BYTE.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["CRC"] = int.from_bytes(
+                    f.read(MetadataLogFile.CRC.value), byteorder="big", signed=True
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Attributes"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.ATTRIBUTES.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Last Offset Delta"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.LAST_OFFSET_DELTA.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Base Timestamp"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.BASE_TIMESTAMP.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Max Timestamp"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.MAX_TIMESTAMP.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Producer ID"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.PRODUCER_ID.value),
+                        byteorder="big",
+                        signed=True,
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Producer Epoch"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.PRODUCER_EPOCH.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Base Sequence"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.BASE_SEQUENCE.value), byteorder="big"
+                    )
+                )
+                self.log[f"Record Batch #{Record_Batch}"]["Records Length"] = (
+                    int.from_bytes(
+                        f.read(MetadataLogFile.RECORDS_LENGTH.value), byteorder="big"
+                    )
+                )
+                # Records parsing
+                for record in range(
+                    self.log[f"Record Batch #{Record_Batch}"]["Records Length"]
+                ):
+                    if DEBUG:
+                        print(
+                            f"File position begining of new record in batch : {f.tell()}"
+                        )
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"] = {}
+                    # next field is a varint ...
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Length"
+                    ] = Utilities.read_varint(f, signed=True)
+                    if DEBUG:
+                        print(
+                            f' self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Length"] {self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Length"]}'
+                        )
+                    pos = f.tell()
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Attributes"
+                    ] = int.from_bytes(
+                        f.read(MetadataLogFile.R_ATTRIBUTES.value), byteorder="big"
+                    )
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Timestamp Delta"
+                    ] = int.from_bytes(
+                        f.read(MetadataLogFile.R_TIMESTAMP_DELTA.value), byteorder="big"
+                    )
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Offset Delta"
+                    ] = int.from_bytes(
+                        f.read(MetadataLogFile.R_OFFSET_DELTA.value), byteorder="big"
+                    )
+                    # next field is a varint ...
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Key Length"
+                    ] = Utilities.read_varint(f, signed=True)
+                    if DEBUG:
+                        print(
+                            f'self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Key Length"] : {self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Key Length"]}'
+                        )
+                    if (
+                        self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                            "Key Length"
+                        ]
+                        != -1
+                    ):
+                        self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                            "Key"
+                        ] = 0  # not implemented
+                    else:
+                        self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                            "Key"
+                        ] = 0
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Value Length"
+                    ] = Utilities.read_varint(f, signed=True)
+                    # self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value Length"] = int.from_bytes(f.read(MetadataLogFile.R_VALUE_LENGTH.value), byteorder="big")
+                    if DEBUG:
+                        print(
+                            f'self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value Length"] : {self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value Length"]}'
+                        )
+                    # Value in record parsing
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Value"
+                    ] = {}
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Value"
+                    ]["Frame Version"] = int.from_bytes(
+                        f.read(MetadataLogFile.R_V_FRAME_VERSION.value), byteorder="big"
+                    )
+                    self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"][
+                        "Value"
+                    ]["Type"] = int.from_bytes(
+                        f.read(MetadataLogFile.R_V_TYPE.value), byteorder="big"
+                    )
+                    if DEBUG:
+                        print(
+                            f'self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value"]["Type"]  == {self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value"]["Type"]}'
+                        )
+                    match self.log[f"Record Batch #{Record_Batch}"][
+                        f"Record #{record}"
+                    ]["Value"]["Type"]:
+                        case 2:
+                            # Topic Record
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Version"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_VERSION.value),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Name_Length"] = Utilities.read_varint(
+                                f, signed=False
+                            )
+                            if DEBUG:
+                                print(
+                                    f'self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value"]["Name_Length"] : {self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value"]["Name_Length"]}'
+                                )
+                            # self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value"]["Name_Length"] = int.from_bytes(f.read(MetadataLogFile.R_V_NAME_LENGTH.value), byteorder="big")
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Topic Name"] = int.from_bytes(
+                                f.read(
+                                    self.log[f"Record Batch #{Record_Batch}"][
+                                        f"Record #{record}"
+                                    ]["Value"]["Name_Length"]
+                                    - 1
+                                ),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Topic UUID"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_TOPIC_UUID.value),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Tagged Fields Counts"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_TAGGED_FIELDS_COUNTS.value),
+                                byteorder="big",
+                            )
+                            # TODO : implement tagged fields
+                        case 3:
+                            # Partition Record
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Version"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_VERSION.value),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Partition ID"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_PARTITION_ID.value),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Topic UUID"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_TOPIC_UUID.value),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Replica Array Length"] = int.from_bytes(
+                                f.read(
+                                    MetadataLogFile.R_V_LENGTH_OF_REPLICA_ARRAY.value
+                                ),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Replica Array"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_REPLICA_ARRAY.value),
+                                byteorder="big",
+                            )
+                        case 12:
+                            # Feature Level Record
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Version"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_VERSION.value),
+                                byteorder="big",
+                            )
+                            val = ""
+                            while True:
+                                b = f.read(MetadataLogFile.R_V_NAME_LENGTH.value)
+                                num = bin(int.from_bytes(b))[2:].zfill(8)
+                                val = num[1:] + val
+                                if Utilities.test_msb(b) is False:
+                                    break
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Name_Length"] = int(val, 2)
+                            # self.log[f"Record Batch #{Record_Batch}"][f"Record #{record}"]["Value"]["Name_Length"] = int.from_bytes(f.read(MetadataLogFile.R_V_NAME_LENGTH.value), byteorder="big")
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Name"] = int.from_bytes(
+                                f.read(
+                                    self.log[f"Record Batch #{Record_Batch}"][
+                                        f"Record #{record}"
+                                    ]["Value"]["Name_Length"]
+                                    - 1
+                                ),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Feature Level"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_FEATURE_LEVEL.value),
+                                byteorder="big",
+                            )
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["Tagged Fields Counts"] = int.from_bytes(
+                                f.read(MetadataLogFile.R_V_TAGGED_FIELDS_COUNTS.value),
+                                byteorder="big",
+                            )
+                            # TODO : implement tagged fields
+                        case _:
+                            if DEBUG:
+                                print("UNSUPPORTED")
+                            # unsupported
+                            self.log[f"Record Batch #{Record_Batch}"][
+                                f"Record #{record}"
+                            ]["Value"]["unsupported"] = self.log[
+                                f"Record Batch #{Record_Batch}"
+                            ][
+                                f"Record #{record}"
+                            ][
+                                "Value"
+                            ][
+                                "Type"
+                            ]
+                            # rewind until "Attributes"
+                    f.seek(
+                        pos
+                        + self.log[f"Record Batch #{Record_Batch}"][
+                            f"Record #{record}"
+                        ]["Length"]
+                    )
+                Record_Batch += 1
+    def __str__(self):
+        return f"""===============================  BEGINNING OF parsed Metadata log file   =====================================  
+        {json.dumps(self.log, indent=4)} \
+        ===============================  END OF parsed Metadata log file  ====================================="""
+    def find_partitions_details_for_topic(self, uuid_value: str) -> bool | list[Any]:
+        """MetaDatalog method for returning partition details from a topic uuid
+        Args:
+            uuid_value (str): topic uuid
+        Returns:
+            dict | bool : dictionnary with partition ID, Replicas, etc - very partially implemented OR False if no partition found
+        """
+        partitions_found = []
+        for record_batch, _content in self.log.items():
+            # Record Batch level
+            for i in range(self.log[record_batch]["Records Length"]):
+                if self.log[record_batch][f"Record #{i}"]["Value"]["Type"] == 3:
+                    if (
+                        self.log[record_batch][f"Record #{i}"]["Value"]["Topic UUID"]
+                        == uuid_value
+                    ):
+                        if DEBUG:
+                            print("++++++++++PARTION RECORD FOUND++++++++++")
+                        partitions_found.append(
+                            (
+                                self.log[record_batch][f"Record #{i}"]["Value"][
+                                    "Partition ID"
+                                ],
+                                self.log[record_batch][f"Record #{i}"]["Value"][
+                                    "Replica Array Length"
+                                ],
+                                self.log[record_batch][f"Record #{i}"]["Value"][
+                                    "Replica Array"
+                                ],
+                            )
+                        )
+        if not partitions_found:
+            if DEBUG:
+                print(f"+++++++++++++TOPIC UUID {uuid_value} NOT FOUND ")
+            return False
+        return partitions_found
+    def find_topic(self, topic_name: str) -> int | bool:
+        """MetaDatalog method for returning a Topic UUID if a topic name
+        Args:
+            topic_name (str)
+        Returns:
+            Topic UUID in int format or False if not found
+        """
+        if DEBUG:
+            print(f"SEARCHING {topic_name}")
+        for record_batch, _content in self.log.items():
+            # Record Batch level
+            for i in range(self.log[record_batch]["Records Length"]):
+                if self.log[record_batch][f"Record #{i}"]["Value"]["Type"] == 2:
+                    if (
+                        self.log[record_batch][f"Record #{i}"]["Value"]["Topic Name"]
+                        == topic_name
+                    ):
+                        if DEBUG:
+                            print("++++++++++TOPIC FOUND ++++++++++")
+                        return self.log[record_batch][f"Record #{i}"]["Value"][
+                            "Topic UUID"
+                        ]
+        if DEBUG:
+            print(f"+++++++++++++TOPIC {topic_name} NOT FOUND ")
+        return False
+class DescribeTopicPartitions(BaseBinaryHandler):
+    @staticmethod
+    def parse_body(request_body: bytes) -> dict:
+        parsed_body = {}
+        (parsed_body["topics_array_length"],), _remaining = Utilities.unpack_helper(
+            ">B", request_body
+        )
+        topic = []
+        for _topic_number in range(parsed_body["topics_array_length"] - 1):
+            # parse the topic name length first and then use this information to parse the topic name itself
+            # the topic id is then created through uuid
+            topic_name_length, _remaining = Utilities.unpack_helper(">B", _remaining)
+            _topic, _remaining = Utilities.unpack_helper(
+                f">{(topic_name_length[0]) - 1}B", _remaining
+            )
+            # print(f"topic name : { Utilities.stringify(_topic)}")
+            topic.append(
+                {
+                    "topic_name": _topic,
+                    "topic_name_length": topic_name_length[0],
+                    "topic_name_id": tuple(
+                        uuid.UUID(int=_topic_number).bytes
+                    ),  # Fake value so that it can be iterated
+                }
+            )
+            _tag_buffer, _remaining = Utilities.unpack_helper(">b", _remaining)
+        parsed_body["topics"] = topic
+        (
+            (
+                parsed_body["response_partition_limit"],
+                parsed_body["cursor"],
+                _tag_buffer,
+            ),
+            _remaining,
+        ) = Utilities.unpack_helper(">IBB", _remaining)
+        return parsed_body
+    @staticmethod
+    async def prepare_response_body(parsed_request):
+        # for DescribeTopicPartitions, parsing the request body is required
+        fields = DescribeTopicPartitions.parse_body(parsed_request.request_body)
+        Utilities.display(fields, "DescribeTopicPartitions Parsed Request Body")
+        _response = {"throttle_time": {"value": 0, "format": "I"}}
+        # TODO correct this :
+        _response["topic_array_length"] = {
+            "value": fields["topics_array_length"],
+            "format": "B",
+        }
+        fi = f"{path_to_logs}{log_file}"
+        if path.isfile(fi) is False:
+            if DEBUG:
+                print("File Not Found \n\n")
+            Found = False
+            raise FileExistsError
+        for topic in fields["topics"]:
+            # common to all responses :
+            log = MetaDataLog(log_file)
+            ttopic = int.from_bytes(topic["topic_name"])
+            Found = log.find_topic(ttopic)
+            # for each topic, the response depends on whether the topic is found or not
+            if Found:
+                UUID_int = Found
+                partitions = log.find_partitions_details_for_topic(UUID_int)
+                _response[f"topic_{topic['topic_name_id']}_error_code"] = {
+                    "value": int(error_codes["NONE"]),
+                    "format": "H",
+                }
+                _response[f"topic_{topic['topic_name_id']}_name_length"] = {
+                    "value": topic["topic_name_length"],
+                    "format": "B",
+                }
+                _response[f"topic_{topic['topic_name_id']}_name"] = {
+                    "value": topic["topic_name"],
+                    "format": f"{topic['topic_name_length'] - 1}B",
+                }
+                _response[f"topic_{topic['topic_name_id']}_id"] = {
+                    "value": tuple(uuid.UUID(int=UUID_int).bytes),
+                    "format": "16B",
+                }
+                _response[f"topic_{topic['topic_name_id']}_is_internal"] = {
+                    "value": 0,
+                    "format": "B",
+                }
+                _response[f"topic_{topic['topic_name_id']}_partition_Array_Length"] = {
+                    "value": len(partitions) + 1,
+                    "format": "B",
+                }
+                for index, (
+                    Partition_ID,
+                    Replica_Array_Length,
+                    Replica_Array,
+                ) in enumerate(partitions):
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Error Code"
+                    ] = {
+                        "value": 0,
+                        "format": "H",
+                    }
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Partition Index"
+                    ] = {"value": Partition_ID, "format": "I"}
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Leader ID"
+                    ] = {
+                        "value": 0,
+                        "format": "I",
+                    }
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Leader Epoch"
+                    ] = {"value": 0, "format": "I"}
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Replica Nodes Length"
+                    ] = {"value": Replica_Array_Length, "format": "B"}
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Replica Node_0"
+                    ] = {"value": Replica_Array, "format": "I"}
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} ISR Nodes Array Length"
+                    ] = {"value": 2, "format": "B"}
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} ISR Node_0"
+                    ] = {
+                        "value": 1,
+                        "format": "I",
+                    }
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Eligible Leader Replicas Array Length"
+                    ] = {"value": 1, "format": "B"}
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Last Known ELR Array Length"
+                    ] = {"value": 1, "format": "B"}
+                    _response[
+                        f"topic_{topic['topic_name_id']}_partition_{Partition_ID} Offline Replicas Array Length"
+                    ] = {"value": 1, "format": "B"}
+                    _response[
+                        f"topic_{topic['topic_name_id']}_tag_buffer_partition_{Partition_ID}"
+                    ] = {
+                        "value": 0,
+                        "format": "B",
+                    }
+                _response[
+                    f"topic_{topic['topic_name_id']}_Topic_Authorized_Operations"
+                ] = {"value": 0xDF8, "format": "I"}
+                _response[f"topic_{topic['topic_name_id']}_tag_buffer_2"] = {
+                    "value": 0,
+                    "format": "B",
+                }
+            else:
+                _response[f"topic_{topic['topic_name_id']}_error_code"] = {
+                    "value": int(error_codes["UNKNOWN_TOPIC_OR_PARTITION"]),
+                    "format": "H",
+                }
+                _response[f"topic_{topic['topic_name_id']}_name_length"] = {
+                    "value": topic["topic_name_length"],
+                    "format": "B",
+                }
+                _response[f"topic_{topic['topic_name_id']}_name"] = {
+                    "value": topic["topic_name"],
+                    "format": f"{topic['topic_name_length'] - 1}B",
+                }
+                _response[f"topic_{topic['topic_name_id']}_id"] = {
+                    "value": topic["topic_name_id"],
+                    "format": "16B",
+                }
+                _response[f"topic_{topic['topic_name_id']}_is_internal"] = {
+                    "value": 0,
+                    "format": "B",
+                }
+                _response[f"topic_{topic['topic_name_id']}_partition_array"] = {
+                    "value": 1,
+                    "format": "B",
+                }
+                _response[
+                    f"topic_{topic['topic_name_id']}_Topic_Authorized_Operations"
+                ] = {"value": 0xDF8, "format": "I"}
+                _response[f"topic_{topic['topic_name_id']}_tag_buffer"] = {
+                    "value": 0,
+                    "format": "B",
+                }
+        _response["next_cursor"] = {"value": 0xFF, "format": "B"}
+        _response["_tag_buffer"] = {"value": 0, "format": "B"}
+        return _response
+class APIVersions(BaseBinaryHandler):
+    # APIVersions primitive does not require to parse the request body (?)
+    @staticmethod
+    async def prepare_response_body(parsed_request):
+        api_version_error_code = Utilities.check_api_version(
+            parsed_request.request_V2_header["request_api_version"]
+        )
+        if api_version_error_code != 0:
+            return {
+                "api_version_error_code": {
+                    "value": api_version_error_code,
+                    "format": "H",
+                }
+            }
         else:
-            topic_buffer += struct.pack(">h", 3)  # UNKNOWN_TOPIC_OR_PARTITION
-        # string length and topic name
-        topic_buffer += struct.pack(">b", len(topic) + 1)  # Compact string length
-        topic_buffer += struct.pack(f">{len(topic)}s", topic)  # Topic name
-        # topic id (UUID)
-        if available:
-            uuid_str = self.available_topics[topic]["uuid"]
-            uuid_bytes = uuid_str.bytes
-        else:
-            # Use all zeros for unknown topics
-            uuid_bytes = bytes(16)
-        topic_buffer += struct.pack("16s", uuid_bytes)
-        # is_internal flag (false)
-        topic_buffer += struct.pack(">b", 0)
-        # partitions array
-        if available and self.available_topics[topic]["partitions"]:
-            # Add 1 for compact array format
-            topic_buffer += struct.pack(">b", len(self.available_topics[topic]["partitions"]) + 1)
-            for id in self.available_topics[topic]["partitions"]:
-                topic_buffer += self.add_partition(self.partitions[id])
-        else:
-            # Empty array (just the length byte)
-            topic_buffer += struct.pack(">b", 1)
-        # topic_authorized_operations
-        topic_buffer += struct.pack(">I", 0x00000DF8)
-        # tag buffer
-        topic_buffer += struct.pack(">b", 0)
-        return topic_buffer
-
-    def add_partition(self, partition):
-        ret = b""
-        # error code
-        ret += struct.pack(">h", 0)
-        # partition index
-        ret += struct.pack(">I", int.from_bytes(partition["id"]))
-        # leader
-        ret += struct.pack(">I", int.from_bytes(partition["leader"]))
-        # leader_epoch
-        ret += struct.pack(">I", int.from_bytes(partition["leader_epoch"]))
-        # replica_nodes (empty array)
-        ret += struct.pack(">b", 1)
-        # isr_nodes (empty array)
-        ret += struct.pack(">b", 1)
-        # eligible_leader_replicas (empty array)
-        ret += struct.pack(">b", 1)
-        # last_known_elr (empty array)
-        ret += struct.pack(">b", 1)
-        # offline_replicas (empty array)
-        ret += struct.pack(">b", 1)
-        # tagged fields
-        ret += struct.pack(">b", 0)
-
-        return ret
-
-    def construct_message(self):
-        header = self.id
-        header += TAG_BUFFER  # Tagged fields in header
-        # Response body
-        body = DEFAULT_THROTTLE_TIME  # throttle_time_ms: 0
-        # Topics array (compact format)
-        body += int(len(self.topics) + 1).to_bytes(1)  # Array length
-        # Add all topic information
-        for topic in self.topics:
-            body += self.create_topic_item(topic.encode("utf-8"))
-        # Add cursor (null cursor)
-        body += struct.pack(">B", 0xFF)  # 0xFF indicates a null cursor
-        # Tagged fields at end of response
-        body += TAG_BUFFER
-
-        return header + body
-
-
-async def client_handler(metadata, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    while True:
-        data = await reader.read(1024)
-        if not data:
-            break
-        header = KafkaHeader(data)
-        if header.key_int == 18:
-            request = ApiRequest(header.version_int, header.id)
-            message = request.message
-        elif header.key_int == 75:  # DescribeTopicPartitions API
-            request = DescribeTopicPartitionsRequest(header.id, header.body, metadata)
-            message = request.message
-        else:
-            request = TopicRequest(header.id, header.body, metadata)
-            message = request.message
-        writer.write(message)
-        await writer.drain()
-    writer.close()
-    await writer.wait_closed()
-
-async def run_server(metadata, port, host):
-    server = await asyncio.start_server(
-        # Use await for start_server
-        lambda r,
-        w: client_handler(metadata, r, w),
-        host, port,
-        reuse_port=True
-    )
-    addr = server.sockets[0].getsockname() if server.sockets else ("unknown", 0)
-    print(f"Server listening on {addr[0]}:{addr[1]}...")
-    # Ensures server.close() and server.wait_closed() on exit or cancellation
-    async with server:
-        # Use await for serve_forever
-        await server.serve_forever()
-
-
+            _response = {
+                "api_version_error_code": {
+                    "value": api_version_error_code,
+                    "format": "H",
+                },
+                "API_version_array_length": {
+                    "value": len(supported_API_keys) + 1,
+                    "format": "B",
+                },
+            }
+            for numerical_API_key, name_min_max_dic in supported_API_keys.items():
+                _response[name_min_max_dic["name"]] = {
+                    "value": numerical_API_key,
+                    "format": "H",
+                }
+                _response[name_min_max_dic["name"] + "_min"] = {
+                    "value": name_min_max_dic["min"],
+                    "format": "H",
+                }
+                _response[name_min_max_dic["name"] + "_max"] = {
+                    "value": name_min_max_dic["max"],
+                    "format": "H",
+                }
+                _response[name_min_max_dic["name"] + "_tag_buffer"] = {
+                    "value": 0,
+                    "format": "B",
+                }
+            _response["throttle_time_ms"] = {"value": 0, "format": "I"}
+            _response["throttle_time_ms_tag_buffer"] = {"value": 0, "format": "B"}
+            if DEBUG:
+                print(f" RESPONSE DIC : {_response}")
+            return _response
+class BaseRequestParser(ABC):
+    """Abstract class for parsing data"""
+    @abstractmethod
+    def __init__(self, incoming_data):
+        pass
+    def Kafka_message_size(request: bytes) -> dict:
+        pass
+    def Kafka_request_header(request: bytes) -> dict:
+        pass
+class RequestParser_V2(BaseRequestParser):
+    def __init__(self, incoming_data):
+        self.header_length = 0
+        self.request_V2_header_message_size = self.Kafka_message_size(incoming_data[:4])
+        self.request_V2_header = self.Kafka_request_header(incoming_data[4:])
+        self.request_body = incoming_data[4 + self.header_length :]
+    def Kafka_message_size(self, request: bytes) -> dict:
+        message_size, remaining = Utilities.unpack_helper(">I", request)
+        return {"message_size": message_size[0]}
+    def Kafka_request_header(self, request: bytes) -> dict:
+        (
+            (
+                request_api_key,
+                request_api_version,
+                correlation_id,
+                client_id_length,
+            ),
+            _remaining,
+        ) = Utilities.unpack_helper(">HHIH", request)
+        self.header_length += 10
+        client_id_content, _remaining = Utilities.unpack_helper(
+            f">{int(client_id_length)}B", _remaining
+        )
+        self.header_length += client_id_length + 1  # +1 for final tag buffer'''
+        return {
+            "request_api_key": request_api_key,
+            "request_api_version": request_api_version,
+            "correlation_id": correlation_id,
+            "client_id_length": client_id_length,
+            "client_id_content": client_id_content,
+        }
+class AsyncBinaryServer:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+    ):
+        self.host = host
+        self.port = port
+        self.server: asyncio.Server = None
+        self.loop = asyncio.get_event_loop()
+    async def handle_new_connection(self, conn, addr):
+        if DEBUG:
+            print(f"connected by {addr}")
+        while True:
+            data_rcv = await self.loop.sock_recv(conn, 1024)
+            if DEBUG:
+                print(data_rcv.hex(" ", 1))
+            # Parse request header
+            parsed_request = RequestParser_V2(data_rcv)
+            if DEBUG:
+                Utilities.display(
+                    parsed_request.request_V2_header, "Parsed Request header V2"
+                )
+            API_Key = parsed_request.request_V2_header["request_api_key"]
+            if API_Key not in supported_API_keys.keys():
+                raise KeyError(f"API Key : {API_Key} is not yet supported")
+            else:
+                # instance class responsible for that API key
+                API_Key_class_name = supported_API_keys[API_Key]["name"]
+                API_Key_class = globals()[API_Key_class_name]
+                # Prepare header for response :
+                correlation_id = {
+                    "value": parsed_request.request_V2_header["correlation_id"],
+                    "format": "I",
+                }
+                tag_buffer = {"value": 0, "format": "B"}
+                if API_Key == 18:
+                    # send request header V0
+                    data_to_send = pack(
+                        ">" + correlation_id["format"], correlation_id["value"]
+                    )
+                else:
+                    # send request header V2
+                    data_to_send = pack(
+                        ">" + correlation_id["format"] + tag_buffer["format"],
+                        correlation_id["value"],
+                        tag_buffer["value"],
+                    )
+                if DEBUG:
+                    print(
+                        f"packed correlation id {correlation_id['value']} into {correlation_id['format']}"
+                    )
+                # Prepare response body
+                response_body = await API_Key_class.prepare_response_body(
+                    parsed_request
+                )
+                if DEBUG:
+                    Utilities.display(response_body, "response body")
+                for _field, value_format_pair in response_body.items():
+                    if DEBUG:
+                        print(
+                            f"packed response body {_field} with value {value_format_pair['value']} into {value_format_pair['format']}"
+                        )
+                    if type(value_format_pair["value"]) is tuple:
+                        data_to_send += pack(
+                            ">" + value_format_pair["format"],
+                            *value_format_pair["value"],
+                        )
+                    else:
+                        data_to_send += pack(
+                            ">" + value_format_pair["format"],
+                            value_format_pair["value"],
+                        )
+                message_size = len(data_to_send)
+                data_to_send = pack(">I", message_size) + data_to_send
+                print(f"data sent ; {data_to_send.hex(':')}")
+                await self.loop.sock_sendall(conn, data_to_send)
+    async def start(self):
+        try:
+            if DEBUG:
+                print("Starting server ")
+            self.server = socket.create_server((self.host, self.port), reuse_port=True)
+            self.server.setblocking(False)
+            while True:
+                conn, addr = await self.loop.sock_accept(self.server)  # wait for client
+                try:
+                    self.loop.create_task(self.handle_new_connection(conn, addr))
+                except KeyError:
+                    raise
+        except Exception as e:
+            if DEBUG:
+                print(f"Server Error {e}")
+        finally:
+            await self.stop()
+    async def stop(self):
+        if DEBUG:
+            print("Stopping server ")
+        self.server.close
+        if DEBUG:
+            print("Server stopped")
 async def main():
-    port = 9092
-    host = "localhost"
-    # Use print statements as follows for debugging,
-    # they'll be visible when running tests.
-    print("Logs from your program will appear here!")
-    metadata_log_path = "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log"
-    with open(metadata_log_path, "rb") as f:
-        data = f.read()
-        metadata = Metadata(data)
-        f.close()
-    print(metadata.topics)
-    # Call run_server as a coroutine
-    await run_server(metadata, port, host)
-
-asyncio.run(main())
+    ze_server = AsyncBinaryServer(host="localhost", port=9092)
+    try:
+        await ze_server.start()
+    except Exception as e:
+        if DEBUG:
+            print(f"Caught other exception in high: {str(e)}")
+        await ze_server.stop()
+if __name__ == "__main__":
+    asyncio.run(main())
