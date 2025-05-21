@@ -5,8 +5,11 @@ def create_message(id):
     return len(id_bytes).to_bytes(4, byteorder="big") + id_bytes
 
 def handle_client(client):
-    client.recv(1024)
-    client.sendall(create_message(7))
+    # client.recv(1024)
+    # client.sendall(create_message(7))
+    req = client.recv(1024)
+    coRelationId = int.from_bytes(req[8:12], byteorder="big")
+    client.sendall(create_message(coRelationId))
     client.close()
 
 def main():
