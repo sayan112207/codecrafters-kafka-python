@@ -3,7 +3,7 @@ import socket  # noqa: F401
 import struct
 import sys
 
-from .metadata import Metadata
+from app.metadata import Metadata
 ERRORS = {
     "ok": int(0).to_bytes(2, byteorder="big"),
     "error": int(35).to_bytes(2, byteorder="big"),
