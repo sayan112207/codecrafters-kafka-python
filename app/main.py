@@ -1,109 +1,79 @@
 import socket  # noqa: F401
-# import struct
-# import sys
-
-# def create_message(correlation_id: int, error_code: int | None = None) -> bytes:
-#     message = correlation_id.to_bytes(4, byteorder="big", signed=True)
-#     if error_code is not None:
-#         message += error_code.to_bytes(2, byteorder="big", signed=True)
-#     message_len = len(message).to_bytes(4, byteorder="big", signed=False)
-#     return message_len + message
-
-# def parse_request(request: bytes) -> dict[str, int | str]:
-#     buff_size = struct.calcsize(">ihhi")
-#     length, api_key, api_version, correlation_id = struct.unpack(
-#         ">ihhi", request[0:buff_size]
-#     )
-#     return {
-#         "length": length,
-#         "api_key": api_key,
-#         "api_version": api_version,
-#         "correlation_id": correlation_id,
-#     }
-import select
-from dataclasses import dataclass
-from enum import Enum, unique
-@unique
-class ErrorCode(Enum):
-    NONE = 0
-    UNSUPPORTED_VERSION = 35
-@dataclass
-class KafkaRequest:
-    api_key: int
-    api_version: int
-    correlation_id: int
-    @staticmethod
-    def from_client(client: socket.socket):
-        data = client.recv(2048)
-        return KafkaRequest(
-            api_key=int.from_bytes(data[4:6]),
-            api_version=int.from_bytes(data[6:8]),
-            correlation_id=int.from_bytes(data[8:12]),
-        )
-    
-def make_response(request: KafkaRequest):
-    response_header = request.correlation_id.to_bytes(4)
-    valid_api_versions = [0, 1, 2, 3, 4]
-    error_code = (
-        ErrorCode.NONE
-        if request.api_version in valid_api_versions
-        else ErrorCode.UNSUPPORTED_VERSION
-    )
-    min_version, max_version = 0, 4
-    throttle_time_ms = 0
-    tag_buffer = b"\x00"
-    response_body = (
-        error_code.value.to_bytes(2)
-        + int(2).to_bytes(1)
-        + request.api_key.to_bytes(2)
-        + min_version.to_bytes(2)
-        + max_version.to_bytes(2)
-        + tag_buffer
-        + throttle_time_ms.to_bytes(4)
-        + tag_buffer
-    )
-    response_length = len(response_header) + len(response_body)
-    return int(response_length).to_bytes(4) + response_header + response_body
-
-def main():
-    print("Logs from your program will appear here!")
-
-    server = socket.create_server(("localhost", 9092), reuse_port=True)
-    # client, _ = server.accept()
-    # request = client.recv(1024)
-    # request_data = parse_request(request)
-    # #server.accept() # wait for client
-
-    # if 0 <= request_data["api_version"] <= 4:
-    #     message = create_message(request_data["correlation_id"])
-    # else:
-    #     message = create_message(
-    #         request_data["correlation_id"], 35
-    #     )
-
-    # client.sendall(message)
-    # client.close()
-    # server.close()
-
-    # while True:
-    #     request = KafkaRequest.from_client(client)
-    #     print(request)
-    #     client.sendall(make_response(request))
-
-    client_sockets = set()
-    while True:
-        ready_read_sockets, _, _ = select.select(
-            client_sockets.union({server}), [], []
-        )
-        for s in ready_read_sockets:
-            if s is server:
-                client_socket, _ = server.accept()
-                client_sockets.add(client_socket)
-                continue
-            request = KafkaRequest.from_client(s)
-            print(request)
-            s.sendall(make_response(request))
-
-
-if __name__ == "__main__":
-    main()
+import struct
+import threading
+from app.functions import encode_unsigned_varint, api_key
+from app.request import Request
+class Broker:
+    def __init__(self):
+        self.server = socket.create_server(("localhost", 9092), reuse_port=True)
+        self.api_versions = {
+            18: (0, 4),
+            75: (0, 0),
+        }
+        self.handlers = {
+            m._api_key: getattr(self, m.__name__)
+            for m in Broker.__dict__.values()
+            if hasattr(m, "_api_key")
+        }
+    def serve(self):
+        print("Broker listening on port 9092")
+        while True:
+            con, addr = self.server.accept()
+            print(f"Accepted connection from {addr}")
+            t = threading.Thread(
+                target=self._serve_connection, args=(con,), daemon=True
+            )
+            t.start()
+    def _serve_connection(self, con: socket.socket):
+        with con:
+            while True:
+                try:
+                    req = Request.from_socket(con)
+                except Exception as e:
+                    print("Error handling connection:", e)
+                    break
+                try:
+                    self.handle(con, req)
+                except Exception as e:
+                    print("Handler error:", e)
+                    break
+    def handle(self, con: socket.socket, req: Request):
+        print(f"Received request: {req}")
+        if req.api_key not in self.api_versions:
+            return self._send_error(con, req.correlation_id, error_code=3)
+        min_v, max_v = self.api_versions[req.api_key]
+        if not (min_v <= req.api_version <= max_v):
+            return self._send_error(con, req.correlation_id, error_code=35)
+        handler = self.handlers.get(req.api_key)
+        if not handler:
+            return self._send_error(con, req.correlation_id, error_code=3)
+        payload = self.handlers[req.api_key](req)
+        self._send_response(con, req.correlation_id, payload)
+    def _send_response(self, conn: socket.socket, correlation_id: int, payload: bytes):
+        """
+        Send a Kafka response: [length:int32][correlation_id:uint32][payload bytefs]
+        """
+        total_length = 4 + len(payload)  # 4 bytes for correlation_id
+        header = struct.pack(">I", total_length) + struct.pack(">I", correlation_id)
+        message = header + payload
+        conn.sendall(message)
+    def _send_error(self, con: socket.socket, correlation_id: int, error_code: int):
+        """
+        Send a simple error response with only an int16 error_code in payload.
+        """
+        payload = struct.pack(">h", error_code)
+        self._send_response(con, correlation_id, payload)
+    @api_key(18)
+    def handle_api_versions(self, req: Request) -> bytes:
+        apis = list(self.api_versions.items())
+        body = struct.pack(">h", 0)
+        body += encode_unsigned_varint(len(apis) + 1)
+        for key, (min_v, max_v) in apis:
+            body += struct.pack(">hhh", key, min_v, max_v)
+            # tagged_fields for this entry (empty)
+            body += encode_unsigned_varint(0)
+        # 4) throttle_time_ms (0)
+        body += struct.pack(">i", 0)
+        # 5) final tagged_fields (empty)
+        body += encode_unsigned_varint(0)
+        return body
