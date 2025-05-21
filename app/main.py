@@ -20,7 +20,7 @@ import socket  # noqa: F401
 #         "api_version": api_version,
 #         "correlation_id": correlation_id,
 #     }
-
+import select
 from dataclasses import dataclass
 from enum import Enum, unique
 @unique
@@ -69,7 +69,7 @@ def main():
     print("Logs from your program will appear here!")
 
     server = socket.create_server(("localhost", 9092), reuse_port=True)
-    client, _ = server.accept()
+    # client, _ = server.accept()
     # request = client.recv(1024)
     # request_data = parse_request(request)
     # #server.accept() # wait for client
@@ -85,10 +85,24 @@ def main():
     # client.close()
     # server.close()
 
+    # while True:
+    #     request = KafkaRequest.from_client(client)
+    #     print(request)
+    #     client.sendall(make_response(request))
+
+    client_sockets = set()
     while True:
-        request = KafkaRequest.from_client(client)
-        print(request)
-        client.sendall(make_response(request))
+        ready_read_sockets, _, _ = select.select(
+            client_sockets.union({server}), [], []
+        )
+        for s in ready_read_sockets:
+            if s is server:
+                client_socket, _ = server.accept()
+                client_sockets.add(client_socket)
+                continue
+            request = KafkaRequest.from_client(s)
+            print(request)
+            s.sendall(make_response(request))
 
 
 if __name__ == "__main__":
