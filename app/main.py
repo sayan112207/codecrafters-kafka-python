@@ -17,7 +17,11 @@ def main():
     # Uncomment this to pass the first stage
     #
     server = socket.create_server(("localhost", 9092), reuse_port=True)
-    server.accept() # wait for client
+    #server.accept() # wait for client
+
+    while True:
+        client, addr = server.accept()
+        handle_client(client)
 
 
 if __name__ == "__main__":
