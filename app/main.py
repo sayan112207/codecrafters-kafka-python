@@ -85,9 +85,10 @@ def main():
     # client.close()
     # server.close()
 
-    request = KafkaRequest.from_client(client)
-    print(request)
-    client.sendall(make_response(request))
+    while True:
+        request = KafkaRequest.from_client(client)
+        print(request)
+        client.sendall(make_response(request))
 
 
 if __name__ == "__main__":
