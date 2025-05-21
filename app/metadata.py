@@ -1,119 +1,128 @@
-import uuid
+from app.util import (
+    read_signed_varint_from_file,
+    read_unsigned_varint_from_file,
+    int_to_var_int,
+)
 from collections import defaultdict
-from .parser import ByteParser
-
-BASE_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
-
-class Metadata:
-    def __init__(self, file):
-        self.parser = ByteParser(file)
-        self.batches = 0
-        self.topics = defaultdict(lambda: {"uuid": BASE_UUID, "partitions": []})
-        self.partitions = {}
-        self.parse_log_file()
-        for id in self.partitions.keys():
-            topic_uuids = self.partitions[id]["topics"]
-            for uuid in topic_uuids:
-                for topic in self.topics:
-                    if uuid == self.topics[topic]["uuid"]:
-                        self.topics[topic]["partitions"].append(id)
-
-    def parse_log_file(self):
-        batches = self.separate_batches()
-        for batch in batches:
-            self.parse_batch(batch)
-
-    def separate_batches(self):
-        parser = self.parser
-        batches = []
-        while not parser.finished:
-            offset = parser.consume(8)
-            print(f"offset {int.from_bytes(offset)}")
-            self.batches += 1
-            batch_length = int.from_bytes(parser.consume(4))
-            batches.append(parser.consume(batch_length))
-        return batches
-
-    def parse_batch(self, batch):
-        parser = ByteParser(batch)
-        ple = parser.consume(4)
-        mb = parser.consume(1)
-        crc = parser.consume(4)
-        type = parser.consume(2)
-        offset = parser.consume(4)
-        length = int.from_bytes(offset) + 1
-        created_at = parser.consume(8)
-        updated_at = parser.consume(8)
-        p_id = parser.consume(8)
-        p_epoch = parser.consume(2)
-        base_sequence = parser.consume(4)
-        record_count = parser.consume(4)
-        records = self.separate_records(parser)
-        for record in records:
-            self.parse_record(record)
-
-    def separate_records(self, parser):
-        records = []
-        while not parser.eof():
-            length = parser.consume_var_int()
-            record = parser.consume(length)
-            records.append(record)
-        return records
-
-    def parse_record(self, batch):
-        parser = ByteParser(batch)
-        attribute = parser.consume(1)
-        timestamp_delta = parser.consume_var_int()
-        offset_delta = parser.consume_var_int()
-        key_length = parser.consume_var_int()
-        if key_length != -1:
-            parser.read(1)
-        value_length = parser.consume_var_int()
-        value = parser.consume(value_length)
-        self.parse_value(value)
-
-    def parse_value(self, value):
-        parser = ByteParser(value)
-        frame_version = parser.consume(1)
-        type = int.from_bytes(parser.consume(1))
-        match type:
-            case 2:
-                self.parse_topic(parser)
-            case 3:
-                self.parse_partition(parser)
-
-    def parse_topic(self, parser):
-        version = parser.consume(1)
-        length_of_name = parser.consume_var_int(False) - 1
-        topic_name = parser.consume(length_of_name)
-        raw_uuid = parser.consume(16)
-        self.topics[topic_name] = {"uuid": uuid.UUID(bytes=raw_uuid), "partitions": []}
-
-    def parse_partition(self, parser):
-        version = parser.consume(1)
-        partition_id = parser.consume(4)
-        raw_uuid = parser.consume(16)
-        length_of_replica_array = parser.consume_var_int(False) - 1
-        replicas = self.digest_array(parser, parser.consume_var_int(False) - 1, 4)
-        in_sync = self.digest_array(parser, parser.consume_var_int(False) - 1, 4)
-        removing = self.digest_array(parser, parser.consume_var_int(False) - 1, 4)
-        adding = self.digest_array(parser, parser.consume_var_int(False) - 1, 4)
-        leader = parser.consume(4)
-        epoch = parser.consume(4)
-        partition_epoch = parser.consume(4)
-        directories = self.digest_array(parser, parser.consume_var_int(False) - 1, 4)
-        if partition_id in self.partitions:
-            self.partitions[partition_id]["topics"].append(uuid.UUID(bytes=raw_uuid))
-        else:
-            self.partitions[partition_id] = {
-                "topics": [uuid.UUID(bytes=raw_uuid)],
-                "id": partition_id,
-                "leader": leader,
-                "leader_epoch": epoch,
-            }
-
-    def digest_array(self, parser, length, size_per_item):
-        ret = []
-        for _ in range(length):
-            ret.append(parser.consume(size_per_item))
-        return ret
+class Partition:
+    def __init__(
+        self,
+        partition_index,
+        leader_id,
+        leader_epoch,
+        replica_nodes,
+        isr_nodes,
+        eligible_leader_replicas,
+        last_known_elr,
+        offline_replicas,
+    ):
+        self.partition_index = partition_index
+        self.leader_id = leader_id
+        self.leader_epoch = leader_epoch
+        self.replica_nodes = replica_nodes
+        self.isr_nodes = isr_nodes
+    def get_partition_byte_representation(self):
+        repr = bytearray()
+        # error code
+        repr.extend((0).to_bytes(2, "big"))
+        repr.extend(self.partition_index.to_bytes(4, "big"))
+        repr.extend(self.leader_id.to_bytes(4, "big"))
+        repr.extend(self.leader_epoch.to_bytes(4, "big"))
+        repr.extend(int_to_var_int(len(self.replica_nodes) + 1))
+        for replica_node in self.replica_nodes:
+            repr.extend(replica_node.to_bytes(4, "big"))
+        repr.extend(int_to_var_int(len(self.isr_nodes) + 1))
+        for isr_node in self.isr_nodes:
+            repr.extend(isr_node.to_bytes(4, "big"))
+        # no eligible leaders
+        repr.extend(int_to_var_int(1))
+        # no last known elrs
+        repr.extend(int_to_var_int(1))
+        # no offline replicas
+        repr.extend(int_to_var_int(1))
+        # no tag buffers
+        repr.extend(int_to_var_int(0))
+        return repr
+class MetadataFile:
+    def __init__(self, filename):
+        f = open(filename, "rb")
+        self.topic_map = {}
+        self.topic_uuid_to_partition_map = defaultdict(list)
+        for _ in range(30):
+            self.base_offset = int.from_bytes(f.read(8), "big")
+            self.batch_length = int.from_bytes(f.read(4), "big")
+            # print(hex(self.batch_length))
+            self.partition_leader_epoch = int.from_bytes(f.read(4), "big")
+            self.magic_byte = int.from_bytes(f.read(1), "big")
+            self.check_sum = int.from_bytes(f.read(4), "big")
+            self.attributes = int.from_bytes(f.read(2), "big")
+            self.last_offset_delta = int.from_bytes(f.read(4), "big")
+            self.base_timestamp = int.from_bytes(f.read(8), "big")
+            self.max_timestamp = int.from_bytes(f.read(8), "big")
+            self.producer_id = int.from_bytes(f.read(8), "big")
+            self.producer_epoch = int.from_bytes(f.read(2), "big")
+            self.base_sequence = int.from_bytes(f.read(4), "big")
+            self.records_length = int.from_bytes(f.read(4), "big")
+            for _ in range(self.records_length):
+                record_length = read_signed_varint_from_file(f)
+                attributes = int.from_bytes(f.read(1), "big")
+                timestamp_delta = int.from_bytes(f.read(1), "big")
+                offset_delta = read_signed_varint_from_file(f)
+                key_length = read_signed_varint_from_file(f)
+                value_length = read_signed_varint_from_file(f)
+                value_frame_version = int.from_bytes(f.read(1), "big")
+                value_type = int.from_bytes(f.read(1), "big")
+                if value_type == 12:
+                    value_feature_version = int.from_bytes(f.read(1), "big")
+                    name_length = read_unsigned_varint_from_file(f)
+                    name = f.read(name_length - 1).decode("utf-8")
+                    feature_level = int.from_bytes(f.read(2), "big")
+                    tagged_fields = read_unsigned_varint_from_file(f)
+                elif value_type == 2:
+                    # topic
+                    value_feature_version = int.from_bytes(f.read(1), "big")
+                    name_length = read_unsigned_varint_from_file(f)
+                    name = f.read(name_length - 1).decode("utf-8")
+                    topic_uuid = int.from_bytes(f.read(16), "big")
+                    tagged_fields = read_unsigned_varint_from_file(f)
+                    self.topic_map[name] = topic_uuid
+                elif value_type == 3:
+                    # partition
+                    value_feature_version = int.from_bytes(f.read(1), "big")
+                    partition_id = int.from_bytes(f.read(4), "big")
+                    topic_uuid = int.from_bytes(f.read(16), "big")
+                    replica_array_size = read_unsigned_varint_from_file(f)
+                    replica_nodes = []
+                    for _ in range(replica_array_size - 1):
+                        replica_id = int.from_bytes(f.read(4), "big")
+                        replica_nodes.append(replica_id)
+                    in_sync_replica_array_size = read_unsigned_varint_from_file(f)
+                    isr_nodes = []
+                    for _ in range(in_sync_replica_array_size - 1):
+                        in_sync_replica_id = int.from_bytes(f.read(4), "big")
+                        isr_nodes.append(in_sync_replica_id)
+                    removing_replica_array_size = read_unsigned_varint_from_file(f)
+                    adding_replica_array_size = read_unsigned_varint_from_file(f)
+                    leader_replica_id = int.from_bytes(f.read(4), "big")
+                    leader_epoch = int.from_bytes(f.read(4), "big")
+                    partition_epoch = int.from_bytes(f.read(4), "big")
+                    directories_array_len = read_unsigned_varint_from_file(f)
+                    for _ in range(directories_array_len - 1):
+                        directories_uuid = int.from_bytes(f.read(16), "big")
+                    tagged_fields = read_unsigned_varint_from_file(f)
+                    partition = Partition(
+                        partition_id,
+                        leader_replica_id,
+                        leader_epoch,
+                        replica_nodes,
+                        isr_nodes,
+                        None,
+                        None,
+                        None,
+                    )
+                    self.topic_uuid_to_partition_map[topic_uuid].append(partition)
+                headers_array_count = read_unsigned_varint_from_file(f)
+    def get_partitions_for_topic(self, topic):
+        if topic not in self.topic_map:
+            return None
+        return self.topic_uuid_to_partition_map[self.topic_map[topic]]
