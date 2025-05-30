@@ -854,24 +854,54 @@ class Fetch(BaseBinaryHandler):
             # Process each topic
             _response["responses_array_length"] = {"value": fields["topics_length"] + 1, "format": "B"}  # Compact array
             
+            # Check if log file exists
+            fi = f"{path_to_logs}{log_file}"
+            log_file_exists = path.isfile(fi)
+            
             for i, topic in enumerate(fields["topics"]):
                 topic_id = topic["topic_id"]
+                topic_id_int = int.from_bytes(topic_id, byteorder="big")
                 
-                # For unknown topics, return UNKNOWN_TOPIC error
                 _response[f"topic_{i}_id"] = {"value": tuple(topic_id), "format": "16B"}
                 _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}  # Compact array with 1 element
                 
-                # Single partition response with UNKNOWN_TOPIC error
-                _response[f"topic_{i}_partition_0_index"] = {"value": 0, "format": "I"}
-                _response[f"topic_{i}_partition_0_error_code"] = {"value": error_codes["UNKNOWN_TOPIC"], "format": "H"}
-                _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 0, "format": "Q"}
-                _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 0, "format": "Q"}
-                _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
-                _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
-                _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
-                _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
-                _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
+                # Check if topic exists in metadata log
+                topic_found = False
+                if log_file_exists:
+                    try:
+                        log = MetaDataLog(log_file)
+                        # Convert topic_id to UUID format and search
+                        topic_uuid = uuid.UUID(bytes=topic_id)
+                        topic_found = log.find_partitions_details_for_topic(topic_uuid.int)
+                        if DEBUG:
+                            print(f"Topic UUID: {topic_uuid}, Found: {topic_found}")
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"Error reading log file: {e}")
+                        topic_found = False
                 
+                if not topic_found:
+                    # Topic doesn't exist - return UNKNOWN_TOPIC error
+                    _response[f"topic_{i}_partition_0_index"] = {"value": 0, "format": "I"}
+                    _response[f"topic_{i}_partition_0_error_code"] = {"value": error_codes["UNKNOWN_TOPIC"], "format": "H"}
+                    _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 0, "format": "Q"}
+                    _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 0, "format": "Q"}
+                    _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
+                    _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
+                    _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
+                    _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
+                else:
+                    # Topic exists but is empty - return success with no records
+                    _response[f"topic_{i}_partition_0_index"] = {"value": 0, "format": "I"}
+                    _response[f"topic_{i}_partition_0_error_code"] = {"value": 0, "format": "H"}  # No error
+                    _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 0, "format": "Q"}
+                    _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 0, "format": "Q"}
+                    _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
+                    _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
+                    _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
+                    _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements (no records)
+                
+                _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
                 _response[f"topic_{i}_tagged_fields"] = {"value": 0, "format": "B"}
         
         _response["tagged_fields"] = {"value": 0, "format": "B"}
