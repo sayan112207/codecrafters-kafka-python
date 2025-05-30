@@ -724,6 +724,16 @@ class APIVersions(BaseBinaryHandler):
             if DEBUG:
                 print(f" RESPONSE DIC : {_response}")
             return _response
+class Fetch(BaseBinaryHandler):
+    @staticmethod
+    async def prepare_response_body(parsed_request):
+        return {
+            "throttle_time_ms":       {"value": 0, "format": "I"},
+            "error_code":             {"value": error_codes["NONE"], "format": "H"},
+            "session_id":             {"value": 0, "format": "I"},
+            "responses_array_length": {"value": 0, "format": "I"},
+            "_tagged_fields":         {"value": 0, "format": "B"},
+        }
 class BaseRequestParser(ABC):
     """Abstract class for parsing data"""
     @abstractmethod
