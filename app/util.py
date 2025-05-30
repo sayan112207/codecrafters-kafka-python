@@ -1,3 +1,14 @@
+def encode_varint(value):
+    out = bytearray()
+    while True:
+        bits = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(0x80 | bits)
+        else:
+            out.append(bits)
+            break
+    return bytes(out)
 def int_to_var_int(n):
     binary_str = "{0:b}".format(n)
     byte_reps = []

@@ -7,6 +7,8 @@ from enum import Enum
 from os import path
 from struct import pack, unpack, calcsize
 from typing import BinaryIO, Any
+from app.util import encode_varint
+
 error_codes = {"NONE": 0, "UNKNOWN_TOPIC_OR_PARTITION": 3, "UNSUPPORTED_VERSION": 35}
 supported_api_version = list(range(5))
 supported_API_keys = {
@@ -727,12 +729,13 @@ class APIVersions(BaseBinaryHandler):
 class Fetch(BaseBinaryHandler):
     @staticmethod
     async def prepare_response_body(parsed_request):
+        tag_bytes = encode_varint(0)
         return {
             "throttle_time_ms":       {"value": 0, "format": "I"},
             "error_code":             {"value": error_codes["NONE"], "format": "H"},
             "session_id":             {"value": 0, "format": "I"},
             "responses_array_length": {"value": 0, "format": "I"},
-            "_tagged_fields":         {"value": 0, "format": "B"},
+            "_tagged_fields":         {"value": tag_bytes, "format": f"{len(tag_bytes)}s"},
         }
 class BaseRequestParser(ABC):
     """Abstract class for parsing data"""
