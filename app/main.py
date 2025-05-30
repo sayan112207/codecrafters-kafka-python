@@ -7,7 +7,11 @@ from enum import Enum
 from os import path
 from struct import pack, unpack, calcsize
 from typing import BinaryIO, Any
-error_codes = {"NONE": 0, "UNKNOWN_TOPIC_OR_PARTITION": 3, "UNSUPPORTED_VERSION": 35}
+error_codes = {
+    "NONE": 0, 
+    "UNKNOWN_TOPIC_OR_PARTITION": 3, 
+    "UNKNOWN_TOPIC": 100, 
+    "UNSUPPORTED_VERSION": 35}
 supported_api_version = list(range(5))
 supported_API_keys = {
     1: {"name": "Fetch", "min": 0, "max": 16},  # Add this line
@@ -724,16 +728,154 @@ class APIVersions(BaseBinaryHandler):
             if DEBUG:
                 print(f" RESPONSE DIC : {_response}")
             return _response
+# class Fetch(BaseBinaryHandler):
+#     @staticmethod
+#     async def prepare_response_body(parsed_request):
+#         _response = {
+#             "throttle_time_ms": {"value": 0, "format": "I"},
+#             "error_code": {"value": 0, "format": "H"},
+#             "session_id": {"value": 0, "format": "I"},
+#             "responses_array_length": {"value": 1, "format": "B"},  # Compact array with 0 elements
+#             "tagged_fields": {"value": 0, "format": "B"}
+#         }
+#         return _response
 class Fetch(BaseBinaryHandler):
     @staticmethod
+    def parse_body(request_body: bytes) -> dict:
+        parsed_body = {}
+        offset = 0
+        
+        # Parse max_wait_ms
+        parsed_body["max_wait_ms"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+        offset += 4
+        
+        # Parse min_bytes
+        parsed_body["min_bytes"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+        offset += 4
+        
+        # Parse max_bytes
+        parsed_body["max_bytes"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+        offset += 4
+        
+        # Parse isolation_level
+        parsed_body["isolation_level"] = int.from_bytes(request_body[offset:offset+1], byteorder="big")
+        offset += 1
+        
+        # Parse session_id
+        parsed_body["session_id"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+        offset += 4
+        
+        # Parse session_epoch
+        parsed_body["session_epoch"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+        offset += 4
+        
+        # Parse topics array length (compact array)
+        topics_length = int.from_bytes(request_body[offset:offset+1], byteorder="big")
+        offset += 1
+        parsed_body["topics_length"] = topics_length - 1  # Compact array: length - 1
+        
+        topics = []
+        for _ in range(parsed_body["topics_length"]):
+            topic = {}
+            
+            # Parse topic_id (16 bytes UUID)
+            topic["topic_id"] = request_body[offset:offset+16]
+            offset += 16
+            
+            # Parse partitions array length (compact array)
+            partitions_length = int.from_bytes(request_body[offset:offset+1], byteorder="big")
+            offset += 1
+            topic["partitions_length"] = partitions_length - 1
+            
+            partitions = []
+            for _ in range(topic["partitions_length"]):
+                partition = {}
+                
+                # Parse partition_index
+                partition["partition_index"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+                offset += 4
+                
+                # Parse current_leader_epoch
+                partition["current_leader_epoch"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+                offset += 4
+                
+                # Parse fetch_offset
+                partition["fetch_offset"] = int.from_bytes(request_body[offset:offset+8], byteorder="big")
+                offset += 8
+                
+                # Parse last_fetched_epoch
+                partition["last_fetched_epoch"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+                offset += 4
+                
+                # Parse log_start_offset
+                partition["log_start_offset"] = int.from_bytes(request_body[offset:offset+8], byteorder="big")
+                offset += 8
+                
+                # Parse partition_max_bytes
+                partition["partition_max_bytes"] = int.from_bytes(request_body[offset:offset+4], byteorder="big")
+                offset += 4
+                
+                # Parse tagged_fields
+                partition["tagged_fields"] = int.from_bytes(request_body[offset:offset+1], byteorder="big")
+                offset += 1
+                
+                partitions.append(partition)
+            
+            topic["partitions"] = partitions
+            
+            # Parse topic tagged_fields
+            topic["tagged_fields"] = int.from_bytes(request_body[offset:offset+1], byteorder="big")
+            offset += 1
+            
+            topics.append(topic)
+        
+        parsed_body["topics"] = topics
+        
+        return parsed_body
+    
+    @staticmethod
     async def prepare_response_body(parsed_request):
+        # Parse the request body to get topic information
+        fields = Fetch.parse_body(parsed_request.request_body)
+        
+        if DEBUG:
+            Utilities.display(fields, "Fetch Parsed Request Body")
+        
         _response = {
             "throttle_time_ms": {"value": 0, "format": "I"},
             "error_code": {"value": 0, "format": "H"},
             "session_id": {"value": 0, "format": "I"},
-            "responses_array_length": {"value": 1, "format": "B"},  # Compact array with 0 elements
-            "tagged_fields": {"value": 0, "format": "B"}
         }
+        
+        # If no topics in request, return empty responses array
+        if fields["topics_length"] == 0:
+            _response["responses_array_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
+        else:
+            # Process each topic
+            _response["responses_array_length"] = {"value": fields["topics_length"] + 1, "format": "B"}  # Compact array
+            
+            for i, topic in enumerate(fields["topics"]):
+                topic_id = topic["topic_id"]
+                
+                # For unknown topics, return UNKNOWN_TOPIC error
+                _response[f"topic_{i}_id"] = {"value": tuple(topic_id), "format": "16B"}
+                _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}  # Compact array with 1 element
+                
+                # Single partition response with UNKNOWN_TOPIC error
+                _response[f"topic_{i}_partition_0_index"] = {"value": 0, "format": "I"}
+                _response[f"topic_{i}_partition_0_error_code"] = {"value": error_codes["UNKNOWN_TOPIC"], "format": "H"}
+                _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 0, "format": "Q"}
+                _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 0, "format": "Q"}
+                _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
+                _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
+                _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
+                _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
+                _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
+                
+                _response[f"topic_{i}_tagged_fields"] = {"value": 0, "format": "B"}
+        
+        _response["tagged_fields"] = {"value": 0, "format": "B"}
+        
         return _response
 class BaseRequestParser(ABC):
     """Abstract class for parsing data"""
