@@ -7,12 +7,10 @@ from enum import Enum
 from os import path
 from struct import pack, unpack, calcsize
 from typing import BinaryIO, Any
-from app.util import encode_varint
-
 error_codes = {"NONE": 0, "UNKNOWN_TOPIC_OR_PARTITION": 3, "UNSUPPORTED_VERSION": 35}
 supported_api_version = list(range(5))
 supported_API_keys = {
-    1: {"name": "Fetch", "min": 0, "max": 16},
+    1: {"name": "Fetch", "min": 0, "max": 16},  # Add this line
     18: {"name": "APIVersions", "min": 0, "max": 4},
     75: {"name": "DescribeTopicPartitions", "min": 0, "max": 0},
 }
@@ -729,14 +727,14 @@ class APIVersions(BaseBinaryHandler):
 class Fetch(BaseBinaryHandler):
     @staticmethod
     async def prepare_response_body(parsed_request):
-        tag_bytes = encode_varint(0)
-        return {
-            "throttle_time_ms":       {"value": 0, "format": "I"},
-            "error_code":             {"value": error_codes["NONE"], "format": "H"},
-            "session_id":             {"value": 0, "format": "I"},
-            "responses_array_length": {"value": 0, "format": "I"},
-            "_tagged_fields":         {"value": tag_bytes, "format": f"{len(tag_bytes)}s"},
+        _response = {
+            "throttle_time_ms": {"value": 0, "format": "I"},
+            "error_code": {"value": 0, "format": "H"},
+            "session_id": {"value": 0, "format": "I"},
+            "responses_array_length": {"value": 1, "format": "B"},  # Compact array with 0 elements
+            "tagged_fields": {"value": 0, "format": "B"}
         }
+        return _response
 class BaseRequestParser(ABC):
     """Abstract class for parsing data"""
     @abstractmethod
@@ -817,6 +815,13 @@ class AsyncBinaryServer:
                     # send request header V0
                     data_to_send = pack(
                         ">" + correlation_id["format"], correlation_id["value"]
+                    )
+                elif API_Key == 1:
+                    # Fetch uses HeaderV1 - send request header V1 (correlation_id + tagged_fields)
+                    data_to_send = pack(
+                        ">" + correlation_id["format"] + tag_buffer["format"],
+                        correlation_id["value"],
+                        tag_buffer["value"],
                     )
                 else:
                     # send request header V2
