@@ -874,6 +874,15 @@ class Fetch(BaseBinaryHandler):
                 log_path = f"/kraft-combined-logs/None-{partition_index}/00000000000000000000.log"
             
             print(f"DEBUG: Trying to read from: {log_path}")
+            
+            # Debug: List what directories actually exist
+            import os
+            try:
+                dirs = os.listdir("/kraft-combined-logs/")
+                print(f"DEBUG: Available directories in /kraft-combined-logs/: {dirs}")
+            except Exception as e:
+                print(f"DEBUG: Cannot list /kraft-combined-logs/: {e}")
+            
             try:
                 with open(log_path, "rb") as f:
                     record_batch_bytes = f.read()
