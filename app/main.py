@@ -869,9 +869,9 @@ class Fetch(BaseBinaryHandler):
                             topic_name = topic_name_bytes.decode("utf-8", errors="ignore")
                             
                             # Debug prints
-                            print(f"DEBUG: Found topic - name_length: {name_length}, topic_name_int: {topic_name_int}")
-                            print(f"DEBUG: topic_name_bytes: {topic_name_bytes}, topic_name: '{topic_name}'")
-                            print(f"DEBUG: log_path will be: /kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log")
+                            # print(f"DEBUG: Found topic - name_length: {name_length}, topic_name_int: {topic_name_int}")
+                            # print(f"DEBUG: topic_name_bytes: {topic_name_bytes}, topic_name: '{topic_name}'")
+                            # print(f"DEBUG: log_path will be: /kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log")
                             
                             break
                     if topic_name is not None:
@@ -880,21 +880,22 @@ class Fetch(BaseBinaryHandler):
                 # Use the correct log path as per tester's directory
                 log_path = f"/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
                 
-                print(f"DEBUG: Trying to read from: {log_path}")
+                # Comment out debug prints for production
+                # print(f"DEBUG: Trying to read from: {log_path}")
 
                 # Debug: List what directories actually exist
                 import os
                 try:
                     dirs = os.listdir("/kraft-combined-logs/")
-                    print(f"DEBUG: Available directories in /kraft-combined-logs/: {dirs}")
+                    # print(f"DEBUG: Available directories in /kraft-combined-logs/: {dirs}")
                 except Exception as e:
-                    print(f"DEBUG: Cannot list /kraft-combined-logs/: {e}")
+                    # print(f"DEBUG: Cannot list /kraft-combined-logs/: {e}")
                     # Try alternative path
                     try:
                         dirs = os.listdir("/tmp/kraft-combined-logs/")
-                        print(f"DEBUG: Available directories in /tmp/kraft-combined-logs/: {dirs}")
+                        # print(f"DEBUG: Available directories in /tmp/kraft-combined-logs/: {dirs}")
                         log_path = f"/tmp/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
-                        print(f"DEBUG: Updated log_path to: {log_path}")
+                        # print(f"DEBUG: Updated log_path to: {log_path}")
                     except Exception as e2:
                         print(f"DEBUG: Cannot list /tmp/kraft-combined-logs/ either: {e2}")
 
@@ -902,7 +903,7 @@ class Fetch(BaseBinaryHandler):
                 try:
                     with open(log_path, "rb") as f:
                         record_batch_bytes = f.read()
-                    print(f"DEBUG: Successfully read {len(record_batch_bytes)} bytes from log file")
+                    # print(f"DEBUG: Successfully read {len(record_batch_bytes)} bytes from log file")
                 except Exception as e:
                     print(f"DEBUG: Failed to read log file: {e}")
                     record_batch_bytes = b""
