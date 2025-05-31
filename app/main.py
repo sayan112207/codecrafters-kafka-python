@@ -866,7 +866,8 @@ class Fetch(BaseBinaryHandler):
                 else:
                     partition_index = 0
 
-                log_path = f"/tmp/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
+                # Use the correct log path as per tester's directory
+                log_path = f"/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
 
                 # Read the entire RecordBatch from the log file
                 try:
@@ -886,8 +887,8 @@ class Fetch(BaseBinaryHandler):
                 _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}
                 _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
 
-                # Only include the RecordBatch if it exists
-                if record_batch_bytes:
+                # Only include the RecordBatch if it exists and is non-empty
+                if record_batch_bytes and len(record_batch_bytes) > 0:
                     _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}  # 1 element
                     _response[f"topic_{i}_partition_0_records"] = {
                         "value": record_batch_bytes,
