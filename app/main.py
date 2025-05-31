@@ -952,7 +952,7 @@ class Fetch(BaseBinaryHandler):
 
                 # Only include the RecordBatch if topic exists and file is non-empty
                 if topic_name is not None and record_batch_bytes and len(record_batch_bytes) > 0:
-                    _response[f"topic_{i}_partition_0_records_length"] = {"value": message_count + 1, "format": "B"}  # Compact array: count + 1
+                    _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}  # Always 1 element (2 in compact array)
                     _response[f"topic_{i}_partition_0_records"] = {
                         "value": record_batch_bytes,
                         "format": f"{len(record_batch_bytes)}s",
