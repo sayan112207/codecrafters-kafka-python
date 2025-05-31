@@ -907,16 +907,16 @@ class Fetch(BaseBinaryHandler):
             _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}
             _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
 
-            # Records - send the raw RecordBatch bytes directly (no length prefix)
+            # Records - send the raw RecordBatch bytes directly
             if record_batch_bytes and len(record_batch_bytes) > 0:
                 # For Fetch response, records field contains raw RecordBatch bytes
-                # The length is implicit from the remaining message size
+                # No additional length or structure - just the raw bytes
                 _response[f"topic_{i}_partition_0_records"] = {
                     "value": record_batch_bytes,
                     "format": f"{len(record_batch_bytes)}s",
                 }
             else:
-                # No records - send empty bytes
+                # No records - send empty bytes  
                 _response[f"topic_{i}_partition_0_records"] = {
                     "value": b"",
                     "format": "0s",
