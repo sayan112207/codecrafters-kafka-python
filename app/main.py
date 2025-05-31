@@ -855,15 +855,13 @@ class Fetch(BaseBinaryHandler):
                             record["Value"]["Type"] == 2
                             and record["Value"]["Topic UUID"] == topic_id_int
                         ):
-                            # Convert topic_name from int to string
+                            # Fix: get the topic name as bytes, not int
+                            name_length = record["Value"]["Name_Length"]
+                            # Seek back to the correct position in the file to read the name as bytes
+                            # Instead, reconstruct the bytes from the int:
                             topic_name_int = record["Value"]["Topic Name"]
-                            if isinstance(topic_name_int, int):
-                                # Convert int to bytes, then decode
-                                length = (topic_name_int.bit_length() + 7) // 8
-                                topic_name = topic_name_int.to_bytes(length, 'big').decode('utf-8', errors='ignore')
-                            else:
-                                # Already bytes
-                                topic_name = topic_name_int.decode('utf-8', errors='ignore')
+                            topic_name_bytes = topic_name_int.to_bytes(name_length - 1, "big")
+                            topic_name = topic_name_bytes.decode("utf-8", errors="ignore")
                             break
                     if topic_name is not None:
                         break
