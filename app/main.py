@@ -904,11 +904,21 @@ class Fetch(BaseBinaryHandler):
                     with open(log_path, "rb") as f:
                         record_batch_bytes = f.read()
                     
-                    # Calculate message count based on file content
-                    if record_batch_bytes:
-                        # For multiple messages, the watermark should reflect the last offset
-                        # Since we have 2 RecordBatches, set watermark to 2
-                        message_count = 2 if len(record_batch_bytes) > 100 else 1  # Simple heuristic
+                    # For multiple messages, we need to count actual RecordBatches
+                    # Each RecordBatch starts with a base_offset (8 bytes) + batch_length (4 bytes)
+                    if record_batch_bytes and len(record_batch_bytes) > 0:
+                        # Count RecordBatches by parsing the file structure
+                        offset = 0
+                        record_batch_count = 0
+                        while offset < len(record_batch_bytes):
+                            if offset + 12 > len(record_batch_bytes):
+                                break
+                            # Read batch_length (4 bytes after base_offset)
+                            batch_length = int.from_bytes(record_batch_bytes[offset+8:offset+12], 'big')
+                            record_batch_count += 1
+                            offset += 12 + batch_length  # Skip to next RecordBatch
+                        
+                        message_count = record_batch_count
                     else:
                         message_count = 0
                         
@@ -942,7 +952,7 @@ class Fetch(BaseBinaryHandler):
 
                 # Only include the RecordBatch if topic exists and file is non-empty
                 if topic_name is not None and record_batch_bytes and len(record_batch_bytes) > 0:
-                    _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}  # 1 element
+                    _response[f"topic_{i}_partition_0_records_length"] = {"value": message_count + 1, "format": "B"}  # Compact array: count + 1
                     _response[f"topic_{i}_partition_0_records"] = {
                         "value": record_batch_bytes,
                         "format": f"{len(record_batch_bytes)}s",
