@@ -845,6 +845,12 @@ class Fetch(BaseBinaryHandler):
                 topic_id = topic["topic_id"]
                 topic_id_int = int.from_bytes(topic_id, byteorder="big")
 
+                # Use the actual partition_index from the request FIRST
+                if topic["partitions"]:
+                    partition_index = topic["partitions"][0]["partition_index"]
+                else:
+                    partition_index = 0
+
                 # Find topic name from topic_id using MetaDataLog
                 log = MetaDataLog(log_file)
                 topic_name = None
@@ -870,12 +876,6 @@ class Fetch(BaseBinaryHandler):
                             break
                     if topic_name is not None:
                         break
-
-                # Use the actual partition_index from the request
-                if topic["partitions"]:
-                    partition_index = topic["partitions"][0]["partition_index"]
-                else:
-                    partition_index = 0
 
                 # Use the correct log path as per tester's directory
                 log_path = f"/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
