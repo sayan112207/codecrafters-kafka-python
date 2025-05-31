@@ -906,23 +906,25 @@ class Fetch(BaseBinaryHandler):
             _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
             _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}
             _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
+            
+            # MOVE TAGGED FIELDS BEFORE RECORDS
+            _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
 
-            # Records - send the raw RecordBatch bytes directly
+            # Records - send the raw RecordBatch bytes directly (MUST BE LAST)
             if record_batch_bytes and len(record_batch_bytes) > 0:
-                # For Fetch response, records field contains raw RecordBatch bytes
-                # No additional length or structure - just the raw bytes
                 _response[f"topic_{i}_partition_0_records"] = {
                     "value": record_batch_bytes,
                     "format": f"{len(record_batch_bytes)}s",
                 }
             else:
-                # No records - send empty bytes  
                 _response[f"topic_{i}_partition_0_records"] = {
                     "value": b"",
                     "format": "0s",
                 }
 
-            _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
+            # REMOVE THIS - NO FIELDS AFTER RECORDS
+            # _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
+            
             _response[f"topic_{i}_tagged_fields"] = {"value": 0, "format": "B"}
 
         _response["tagged_fields"] = {"value": 0, "format": "B"}
