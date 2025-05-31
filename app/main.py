@@ -860,8 +860,12 @@ class Fetch(BaseBinaryHandler):
                     if topic_name is not None:
                         break
 
-                # Default to partition 0 for this stage
-                partition_index = 0
+                # Use the actual partition_index from the request
+                if topic["partitions"]:
+                    partition_index = topic["partitions"][0]["partition_index"]
+                else:
+                    partition_index = 0
+
                 log_path = f"/tmp/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
 
                 # Read the entire RecordBatch from the log file
@@ -874,7 +878,7 @@ class Fetch(BaseBinaryHandler):
                 _response[f"topic_{i}_id"] = {"value": tuple(topic_id), "format": "16B"}
                 _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}  # 1 element
 
-                _response[f"topic_{i}_partition_0_index"] = {"value": 0, "format": "I"}
+                _response[f"topic_{i}_partition_0_index"] = {"value": partition_index, "format": "I"}
                 _response[f"topic_{i}_partition_0_error_code"] = {"value": 0, "format": "H"}
                 _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 1, "format": "Q"}
                 _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 1, "format": "Q"}
@@ -882,12 +886,15 @@ class Fetch(BaseBinaryHandler):
                 _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}
                 _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
 
-                # Records array: 1 element, the RecordBatch bytes
-                _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}
-                _response[f"topic_{i}_partition_0_records"] = {
-                    "value": record_batch_bytes,
-                    "format": f"{len(record_batch_bytes)}s",
-                }
+                # Only include the RecordBatch if it exists
+                if record_batch_bytes:
+                    _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}  # 1 element
+                    _response[f"topic_{i}_partition_0_records"] = {
+                        "value": record_batch_bytes,
+                        "format": f"{len(record_batch_bytes)}s",
+                    }
+                else:
+                    _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}  # 0 elements
 
                 _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
                 _response[f"topic_{i}_tagged_fields"] = {"value": 0, "format": "B"}
