@@ -922,11 +922,7 @@ class Fetch(BaseBinaryHandler):
                     "format": "0s",
                 }
 
-            # REMOVE THIS - NO FIELDS AFTER RECORDS
-            # _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
-            
-            _response[f"topic_{i}_tagged_fields"] = {"value": 0, "format": "B"}
-
+        # Move this OUTSIDE the topic loop - it's a response-level field
         _response["tagged_fields"] = {"value": 0, "format": "B"}
         return _response
 class BaseRequestParser(ABC):
