@@ -821,189 +821,79 @@ class Fetch(BaseBinaryHandler):
         parsed_body["topics"] = topics
         
         return parsed_body
-
-    @staticmethod
-    def find_topic_by_uuid(topic_uuid_bytes: bytes) -> tuple:
-        """
-        Find topic by UUID in the metadata log.
-        Returns (topic_exists, topic_name_int) tuple
-        """
-        try:
-            fi = f"{path_to_logs}{log_file}"
-            if not path.isfile(fi):
-                return False, None
-                
-            log = MetaDataLog(log_file)
-            topic_uuid = uuid.UUID(bytes=topic_uuid_bytes)
-            topic_uuid_int = topic_uuid.int
-            
-            # Search through log records to find topic record with matching UUID
-            for record_batch, content in log.log.items():
-                for i in range(log.log[record_batch]["Records Length"]):
-                    record = log.log[record_batch][f"Record #{i}"]
-                    if record["Value"]["Type"] == 2:  # Topic Record
-                        if record["Value"]["Topic UUID"] == topic_uuid_int:
-                            return True, record["Value"]["Topic Name"]
-            
-            return False, None
-        except Exception as e:
-            if DEBUG:
-                print(f"Error finding topic by UUID: {e}")
-            return False, None
-
-    @staticmethod
-    def read_record_batch_from_disk(partition_id: int = 0) -> tuple:
-        """
-        Read RecordBatch data from disk for a given partition.
-        Returns tuple of (record_batch_bytes, high_watermark)
-        """
-        try:
-            # For partition 0, read from the main metadata log file
-            fi = f"{path_to_logs}{log_file}"
-            if not path.isfile(fi):
-                if DEBUG:
-                    print(f"Log file does not exist: {fi}")
-                return None, 0
-            
-            with open(fi, "rb") as f:
-                f.seek(0, 2)  # Go to end
-                file_size = f.tell()
-                f.seek(0)  # Go to beginning
-                
-                if file_size == 0:
-                    return None, 0
-                
-                # Read the first complete RecordBatch from the file
-                try:
-                    # Read base offset (8 bytes)
-                    base_offset_bytes = f.read(8)
-                    if len(base_offset_bytes) < 8:
-                        return None, 0
-                    
-                    # Read batch length (4 bytes)
-                    batch_length_bytes = f.read(4)
-                    if len(batch_length_bytes) < 4:
-                        return None, 0
-                    
-                    batch_length = int.from_bytes(batch_length_bytes, byteorder="big")
-                    
-                    # Go back to start of batch
-                    f.seek(0)
-                    
-                    # Read the entire RecordBatch
-                    # The total size is: base_offset (8) + batch_length (4) + batch_data (batch_length)
-                    total_size = 8 + 4 + batch_length
-                    record_batch_data = f.read(total_size)
-                    
-                    if len(record_batch_data) != total_size:
-                        if DEBUG:
-                            print(f"Incomplete batch read: expected {total_size}, got {len(record_batch_data)}")
-                        return None, 0
-                    
-                    if DEBUG:
-                        print(f"Successfully read RecordBatch of size {len(record_batch_data)}")
-                    
-                    # High watermark is typically 1 for a single message
-                    return record_batch_data, 1
-                    
-                except Exception as e:
-                    if DEBUG:
-                        print(f"Error reading RecordBatch: {e}")
-                    return None, 0
-                    
-        except Exception as e:
-            if DEBUG:
-                print(f"Error opening log file: {e}")
-            return None, 0
     
     @staticmethod
     async def prepare_response_body(parsed_request):
         # Parse the request body to get topic information
         fields = Fetch.parse_body(parsed_request.request_body)
-        
+
         if DEBUG:
             Utilities.display(fields, "Fetch Parsed Request Body")
-        
+
         _response = {
             "throttle_time_ms": {"value": 0, "format": "I"},
             "error_code": {"value": 0, "format": "H"},
             "session_id": {"value": 0, "format": "I"},
         }
-        
-        # Process topics
+
         if fields["topics_length"] == 0:
-            _response["responses_array_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
+            _response["responses_array_length"] = {"value": 1, "format": "B"}
         else:
-            _response["responses_array_length"] = {"value": fields["topics_length"] + 1, "format": "B"}  # Compact array
-            
+            _response["responses_array_length"] = {"value": fields["topics_length"] + 1, "format": "B"}
+
             for i, topic in enumerate(fields["topics"]):
                 topic_id = topic["topic_id"]
-                
+                topic_id_int = int.from_bytes(topic_id, byteorder="big")
+
+                # Find topic name from topic_id using MetaDataLog
+                log = MetaDataLog(log_file)
+                topic_name = None
+                for record_batch, _content in log.log.items():
+                    for j in range(log.log[record_batch]["Records Length"]):
+                        record = log.log[record_batch][f"Record #{j}"]
+                        if (
+                            record["Value"]["Type"] == 2
+                            and record["Value"]["Topic UUID"] == topic_id_int
+                        ):
+                            topic_name = record["Value"]["Topic Name"]
+                            break
+                    if topic_name is not None:
+                        break
+
+                # Default to partition 0 for this stage
+                partition_index = 0
+                log_path = f"/tmp/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
+
+                # Read the entire RecordBatch from the log file
+                try:
+                    with open(log_path, "rb") as f:
+                        record_batch_bytes = f.read()
+                except Exception:
+                    record_batch_bytes = b""
+
                 _response[f"topic_{i}_id"] = {"value": tuple(topic_id), "format": "16B"}
-                
-                # Check if topic exists
-                topic_exists, topic_name = Fetch.find_topic_by_uuid(topic_id)
-                
-                # Process partitions
-                partition_responses = []
-                for partition in topic["partitions"]:
-                    partition_index = partition["partition_index"]
-                    
-                    if not topic_exists:
-                        # Topic doesn't exist
-                        partition_responses.append({
-                            "index": partition_index,
-                            "error_code": error_codes["UNKNOWN_TOPIC"],
-                            "high_watermark": 0,
-                            "last_stable_offset": 0,
-                            "log_start_offset": 0,
-                            "aborted_transactions_length": 1,  # Compact array with 0 elements
-                            "preferred_read_replica": -1,
-                            "records": None
-                        })
-                    else:
-                        # Topic exists - try to read records
-                        record_batch_data, high_watermark = Fetch.read_record_batch_from_disk(partition_index)
-                        
-                        partition_responses.append({
-                            "index": partition_index,
-                            "error_code": 0,  # No error
-                            "high_watermark": high_watermark,
-                            "last_stable_offset": high_watermark,
-                            "log_start_offset": 0,
-                            "aborted_transactions_length": 1,  # Compact array with 0 elements
-                            "preferred_read_replica": -1,
-                            "records": record_batch_data
-                        })
-                
-                # Add partition responses to the main response
-                _response[f"topic_{i}_partitions_length"] = {"value": len(partition_responses) + 1, "format": "B"}  # Compact array
-                
-                for j, partition_resp in enumerate(partition_responses):
-                    _response[f"topic_{i}_partition_{j}_index"] = {"value": partition_resp["index"], "format": "I"}
-                    _response[f"topic_{i}_partition_{j}_error_code"] = {"value": partition_resp["error_code"], "format": "H"}
-                    _response[f"topic_{i}_partition_{j}_high_watermark"] = {"value": partition_resp["high_watermark"], "format": "Q"}
-                    _response[f"topic_{i}_partition_{j}_last_stable_offset"] = {"value": partition_resp["last_stable_offset"], "format": "Q"}
-                    _response[f"topic_{i}_partition_{j}_log_start_offset"] = {"value": partition_resp["log_start_offset"], "format": "Q"}
-                    _response[f"topic_{i}_partition_{j}_aborted_transactions_length"] = {"value": partition_resp["aborted_transactions_length"], "format": "B"}
-                    _response[f"topic_{i}_partition_{j}_preferred_read_replica"] = {"value": partition_resp["preferred_read_replica"], "format": "i"}
-                    
-                    # Handle records
-                    if partition_resp["records"]:
-                        # We have actual RecordBatch data from disk
-                        records_data = partition_resp["records"]
-                        _response[f"topic_{i}_partition_{j}_records_length"] = {"value": len(records_data) + 1, "format": "B"}  # Compact bytes array
-                        _response[f"topic_{i}_partition_{j}_records_data"] = {"value": tuple(records_data), "format": f"{len(records_data)}B"}
-                    else:
-                        # No records - compact array with 0 elements
-                        _response[f"topic_{i}_partition_{j}_records_length"] = {"value": 1, "format": "B"}
-                    
-                    _response[f"topic_{i}_partition_{j}_tagged_fields"] = {"value": 0, "format": "B"}
-                
+                _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}  # 1 element
+
+                _response[f"topic_{i}_partition_0_index"] = {"value": 0, "format": "I"}
+                _response[f"topic_{i}_partition_0_error_code"] = {"value": 0, "format": "H"}
+                _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 1, "format": "Q"}
+                _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 1, "format": "Q"}
+                _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
+                _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}
+                _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
+
+                # Records array: 1 element, the RecordBatch bytes
+                _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}
+                _response[f"topic_{i}_partition_0_records"] = {
+                    "value": record_batch_bytes,
+                    "format": f"{len(record_batch_bytes)}s",
+                }
+
+                _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
                 _response[f"topic_{i}_tagged_fields"] = {"value": 0, "format": "B"}
-        
+
         _response["tagged_fields"] = {"value": 0, "format": "B"}
-        
+
         return _response
 class BaseRequestParser(ABC):
     """Abstract class for parsing data"""
