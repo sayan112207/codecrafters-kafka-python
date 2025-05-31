@@ -906,11 +906,11 @@ class Fetch(BaseBinaryHandler):
             _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
             _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}
             _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
-            
-            # MOVE TAGGED FIELDS BEFORE RECORDS
-            _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
 
-            # Records - send the raw RecordBatch bytes directly (MUST BE LAST)
+            # REMOVE THIS – no tagged fields for partitions if they cause protocol parsing issues
+            # _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
+
+            # Records MUST be the last field in the partition
             if record_batch_bytes and len(record_batch_bytes) > 0:
                 _response[f"topic_{i}_partition_0_records"] = {
                     "value": record_batch_bytes,
