@@ -922,8 +922,9 @@ class Fetch(BaseBinaryHandler):
                     "format": "0s",
                 }
 
-        # Move this OUTSIDE the topic loop - it's a response-level field
-        _response["tagged_fields"] = {"value": 0, "format": "B"}
+        # REMOVE THIS LINE - NO TAGGED FIELDS AFTER RECORDS
+        # _response["tagged_fields"] = {"value": 0, "format": "B"}
+        
         return _response
 class BaseRequestParser(ABC):
     """Abstract class for parsing data"""
