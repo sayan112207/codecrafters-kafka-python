@@ -728,17 +728,6 @@ class APIVersions(BaseBinaryHandler):
             if DEBUG:
                 print(f" RESPONSE DIC : {_response}")
             return _response
-# class Fetch(BaseBinaryHandler):
-#     @staticmethod
-#     async def prepare_response_body(parsed_request):
-#         _response = {
-#             "throttle_time_ms": {"value": 0, "format": "I"},
-#             "error_code": {"value": 0, "format": "H"},
-#             "session_id": {"value": 0, "format": "I"},
-#             "responses_array_length": {"value": 1, "format": "B"},  # Compact array with 0 elements
-#             "tagged_fields": {"value": 0, "format": "B"}
-#         }
-#         return _response
 class Fetch(BaseBinaryHandler):
     @staticmethod
     def parse_body(request_body: bytes) -> dict:
@@ -832,6 +821,98 @@ class Fetch(BaseBinaryHandler):
         parsed_body["topics"] = topics
         
         return parsed_body
+
+    @staticmethod
+    def read_record_batch_from_disk(topic_uuid_int: int, partition_id: int = 0, fetch_offset: int = 0) -> tuple:
+        """
+        Read RecordBatch data from disk for a given topic and partition.
+        Returns tuple of (record_batch_bytes, high_watermark)
+        """
+        try:
+            # Construct the path to the partition log file
+            # For partition 0, the file is typically named with the topic UUID and partition ID
+            partition_log_path = f"{path_to_logs}__cluster_metadata-{partition_id}/"
+            
+            # Try to find log files in the partition directory
+            import os
+            if not os.path.exists(partition_log_path):
+                if DEBUG:
+                    print(f"Partition log path does not exist: {partition_log_path}")
+                return None, 0
+            
+            # Look for .log files in the directory
+            log_files = [f for f in os.listdir(partition_log_path) if f.endswith('.log')]
+            if not log_files:
+                if DEBUG:
+                    print(f"No log files found in {partition_log_path}")
+                return None, 0
+            
+            # Use the first log file (typically 00000000000000000000.log)
+            log_file_path = os.path.join(partition_log_path, log_files[0])
+            
+            if DEBUG:
+                print(f"Reading from log file: {log_file_path}")
+            
+            with open(log_file_path, "rb") as f:
+                # Read the entire file to find RecordBatches
+                f.seek(0, 2)  # Go to end
+                file_size = f.tell()
+                f.seek(0)  # Go to beginning
+                
+                if file_size == 0:
+                    return None, 0
+                
+                record_batches = []
+                current_offset = 0
+                
+                while f.tell() < file_size:
+                    batch_start = f.tell()
+                    
+                    # Read base offset (8 bytes)
+                    base_offset_bytes = f.read(8)
+                    if len(base_offset_bytes) < 8:
+                        break
+                    base_offset = int.from_bytes(base_offset_bytes, byteorder="big")
+                    
+                    # Read batch length (4 bytes)
+                    batch_length_bytes = f.read(4)
+                    if len(batch_length_bytes) < 4:
+                        break
+                    batch_length = int.from_bytes(batch_length_bytes, byteorder="big")
+                    
+                    # Go back to start of batch
+                    f.seek(batch_start)
+                    
+                    # Read the entire RecordBatch (including the base offset and batch length we just read)
+                    total_batch_size = 8 + 4 + batch_length  # base_offset + batch_length + batch_data
+                    record_batch_data = f.read(total_batch_size)
+                    
+                    if len(record_batch_data) != total_batch_size:
+                        if DEBUG:
+                            print(f"Incomplete batch read: expected {total_batch_size}, got {len(record_batch_data)}")
+                        break
+                    
+                    if DEBUG:
+                        print(f"Found RecordBatch at offset {base_offset}, length {batch_length}")
+                    
+                    record_batches.append((base_offset, record_batch_data))
+                    current_offset = base_offset + 1  # Assuming single record per batch for simplicity
+                
+                # Find the appropriate batch based on fetch_offset
+                for base_offset, batch_data in record_batches:
+                    if base_offset >= fetch_offset:
+                        return batch_data, current_offset
+                
+                # If no suitable batch found, return the last one or None
+                if record_batches:
+                    return record_batches[-1][1], current_offset
+                else:
+                    return None, 0
+                    
+        except Exception as e:
+            if DEBUG:
+                print(f"Error reading RecordBatch from disk: {e}")
+            return None, 0
     
     @staticmethod
     async def prepare_response_body(parsed_request):
@@ -863,45 +944,99 @@ class Fetch(BaseBinaryHandler):
                 topic_id_int = int.from_bytes(topic_id, byteorder="big")
                 
                 _response[f"topic_{i}_id"] = {"value": tuple(topic_id), "format": "16B"}
-                _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}  # Compact array with 1 element
                 
-                # Check if topic exists in metadata log
-                topic_found = False
-                if log_file_exists:
-                    try:
-                        log = MetaDataLog(log_file)
-                        # Convert topic_id to UUID format and search
-                        topic_uuid = uuid.UUID(bytes=topic_id)
-                        topic_found = log.find_partitions_details_for_topic(topic_uuid.int)
-                        if DEBUG:
-                            print(f"Topic UUID: {topic_uuid}, Found: {topic_found}")
-                    except Exception as e:
-                        if DEBUG:
-                            print(f"Error reading log file: {e}")
-                        topic_found = False
+                # Process each partition in the topic
+                partition_responses = []
+                for partition in topic["partitions"]:
+                    partition_index = partition["partition_index"]
+                    fetch_offset = partition["fetch_offset"]
+                    
+                    # Check if topic exists and try to read records
+                    topic_found = False
+                    record_batch_data = None
+                    high_watermark = 0
+                    
+                    if log_file_exists:
+                        try:
+                            log = MetaDataLog(log_file)
+                            # Convert topic_id to UUID format and search
+                            topic_uuid = uuid.UUID(bytes=topic_id)
+                            partitions_info = log.find_partitions_details_for_topic(topic_uuid.int)
+                            
+                            if partitions_info:
+                                topic_found = True
+                                # Try to read actual record batch from disk
+                                record_batch_data, high_watermark = Fetch.read_record_batch_from_disk(
+                                    topic_uuid.int, partition_index, fetch_offset
+                                )
+                                if DEBUG:
+                                    print(f"Topic UUID: {topic_uuid}, Found: {topic_found}, RecordBatch: {'Yes' if record_batch_data else 'No'}")
+                        except Exception as e:
+                            if DEBUG:
+                                print(f"Error processing topic: {e}")
+                            topic_found = False
+                    
+                    if not topic_found:
+                        # Topic doesn't exist - return UNKNOWN_TOPIC error
+                        partition_responses.append({
+                            "index": partition_index,
+                            "error_code": error_codes["UNKNOWN_TOPIC"],
+                            "high_watermark": 0,
+                            "last_stable_offset": 0,
+                            "log_start_offset": 0,
+                            "aborted_transactions_length": 1,  # Compact array with 0 elements
+                            "preferred_read_replica": -1,
+                            "records": None
+                        })
+                    elif record_batch_data:
+                        # Topic exists and has records - return the actual RecordBatch
+                        partition_responses.append({
+                            "index": partition_index,
+                            "error_code": 0,  # No error
+                            "high_watermark": high_watermark,
+                            "last_stable_offset": high_watermark,
+                            "log_start_offset": 0,
+                            "aborted_transactions_length": 1,  # Compact array with 0 elements
+                            "preferred_read_replica": -1,
+                            "records": record_batch_data
+                        })
+                    else:
+                        # Topic exists but has no records
+                        partition_responses.append({
+                            "index": partition_index,
+                            "error_code": 0,  # No error
+                            "high_watermark": 0,
+                            "last_stable_offset": 0,
+                            "log_start_offset": 0,
+                            "aborted_transactions_length": 1,  # Compact array with 0 elements
+                            "preferred_read_replica": -1,
+                            "records": None
+                        })
                 
-                if not topic_found:
-                    # Topic doesn't exist - return UNKNOWN_TOPIC error
-                    _response[f"topic_{i}_partition_0_index"] = {"value": 0, "format": "I"}
-                    _response[f"topic_{i}_partition_0_error_code"] = {"value": error_codes["UNKNOWN_TOPIC"], "format": "H"}
-                    _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 0, "format": "Q"}
-                    _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 0, "format": "Q"}
-                    _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
-                    _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
-                    _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
-                    _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
-                else:
-                    # Topic exists but is empty - return success with no records
-                    _response[f"topic_{i}_partition_0_index"] = {"value": 0, "format": "I"}
-                    _response[f"topic_{i}_partition_0_error_code"] = {"value": 0, "format": "H"}  # No error
-                    _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 0, "format": "Q"}
-                    _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 0, "format": "Q"}
-                    _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
-                    _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
-                    _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
-                    _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements (no records)
+                # Add partition responses to the main response
+                _response[f"topic_{i}_partitions_length"] = {"value": len(partition_responses) + 1, "format": "B"}  # Compact array
                 
-                _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
+                for j, partition_resp in enumerate(partition_responses):
+                    _response[f"topic_{i}_partition_{j}_index"] = {"value": partition_resp["index"], "format": "I"}
+                    _response[f"topic_{i}_partition_{j}_error_code"] = {"value": partition_resp["error_code"], "format": "H"}
+                    _response[f"topic_{i}_partition_{j}_high_watermark"] = {"value": partition_resp["high_watermark"], "format": "Q"}
+                    _response[f"topic_{i}_partition_{j}_last_stable_offset"] = {"value": partition_resp["last_stable_offset"], "format": "Q"}
+                    _response[f"topic_{i}_partition_{j}_log_start_offset"] = {"value": partition_resp["log_start_offset"], "format": "Q"}
+                    _response[f"topic_{i}_partition_{j}_aborted_transactions_length"] = {"value": partition_resp["aborted_transactions_length"], "format": "B"}
+                    _response[f"topic_{i}_partition_{j}_preferred_read_replica"] = {"value": partition_resp["preferred_read_replica"], "format": "i"}
+                    
+                    # Handle records - this is the key part for this stage
+                    if partition_resp["records"]:
+                        # We have actual RecordBatch data from disk
+                        records_data = partition_resp["records"]
+                        _response[f"topic_{i}_partition_{j}_records_length"] = {"value": len(records_data) + 1, "format": "B"}  # Compact array with actual data
+                        _response[f"topic_{i}_partition_{j}_records_data"] = {"value": tuple(records_data), "format": f"{len(records_data)}B"}
+                    else:
+                        # No records
+                        _response[f"topic_{i}_partition_{j}_records_length"] = {"value": 1, "format": "B"}  # Compact array with 0 elements
+                    
+                    _response[f"topic_{i}_partition_{j}_tagged_fields"] = {"value": 0, "format": "B"}
+                
                 _response[f"topic_{i}_tagged_fields"] = {"value": 0, "format": "B"}
         
         _response["tagged_fields"] = {"value": 0, "format": "B"}
