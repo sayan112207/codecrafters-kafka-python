@@ -882,6 +882,22 @@ class Fetch(BaseBinaryHandler):
                 
                 print(f"DEBUG: Trying to read from: {log_path}")
 
+                # Debug: List what directories actually exist
+                import os
+                try:
+                    dirs = os.listdir("/kraft-combined-logs/")
+                    print(f"DEBUG: Available directories in /kraft-combined-logs/: {dirs}")
+                except Exception as e:
+                    print(f"DEBUG: Cannot list /kraft-combined-logs/: {e}")
+                    # Try alternative path
+                    try:
+                        dirs = os.listdir("/tmp/kraft-combined-logs/")
+                        print(f"DEBUG: Available directories in /tmp/kraft-combined-logs/: {dirs}")
+                        log_path = f"/tmp/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
+                        print(f"DEBUG: Updated log_path to: {log_path}")
+                    except Exception as e2:
+                        print(f"DEBUG: Cannot list /tmp/kraft-combined-logs/ either: {e2}")
+
                 # Read the entire RecordBatch from the log file
                 try:
                     with open(log_path, "rb") as f:
