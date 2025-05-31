@@ -855,7 +855,9 @@ class Fetch(BaseBinaryHandler):
                             record["Value"]["Type"] == 2
                             and record["Value"]["Topic UUID"] == topic_id_int
                         ):
-                            topic_name = record["Value"]["Topic Name"]
+                            # Convert topic_name from int to string
+                            topic_name_int = record["Value"]["Topic Name"]
+                            topic_name = topic_name_int.to_bytes((topic_name_int.bit_length() + 7) // 8, 'big').decode(errors="ignore")
                             break
                     if topic_name is not None:
                         break
