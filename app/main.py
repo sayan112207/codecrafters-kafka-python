@@ -847,9 +847,11 @@ class Fetch(BaseBinaryHandler):
             # Find topic name from metadata
             log = MetaDataLog(log_file)
             topic_name = None
+            print(f"DEBUG: Looking for topic UUID: {topic_id_int}")
             for record_batch, _content in log.log.items():
                 for j in range(log.log[record_batch]["Records Length"]):
                     record = log.log[record_batch][f"Record #{j}"]
+                    print(f"DEBUG: Found record type {record['Value']['Type']} with UUID {record['Value'].get('Topic UUID', 'N/A')}")
                     if (
                         record["Value"]["Type"] == 2
                         and record["Value"]["Topic UUID"] == topic_id_int
@@ -858,12 +860,20 @@ class Fetch(BaseBinaryHandler):
                         topic_name_int = record["Value"]["Topic Name"]
                         topic_name_bytes = topic_name_int.to_bytes(name_length - 1, "big")
                         topic_name = topic_name_bytes.decode("utf-8", errors="ignore")
+                        print(f"DEBUG: Found matching topic: {topic_name}")
                         break
                 if topic_name is not None:
                     break
 
+            print(f"DEBUG: Final topic_name: {topic_name}")
+            
             # Try to read log file
-            log_path = f"/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
+            if topic_name:
+                log_path = f"/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
+            else:
+                log_path = f"/kraft-combined-logs/None-{partition_index}/00000000000000000000.log"
+            
+            print(f"DEBUG: Trying to read from: {log_path}")
             try:
                 with open(log_path, "rb") as f:
                     record_batch_bytes = f.read()
