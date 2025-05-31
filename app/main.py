@@ -913,7 +913,6 @@ class Fetch(BaseBinaryHandler):
                         message_count = 0
                         
                 except Exception as e:
-                    print(f"DEBUG: Failed to read log file: {e}")
                     record_batch_bytes = b""
                     message_count = 0
 
