@@ -911,15 +911,21 @@ class Fetch(BaseBinaryHandler):
                 _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}  # 1 element
 
                 _response[f"topic_{i}_partition_0_index"] = {"value": partition_index, "format": "I"}
-                _response[f"topic_{i}_partition_0_error_code"] = {"value": 0, "format": "H"}
+                
+                # Set error code based on whether topic was found
+                if topic_name is None:
+                    _response[f"topic_{i}_partition_0_error_code"] = {"value": 100, "format": "H"}  # UNKNOWN_TOPIC
+                else:
+                    _response[f"topic_{i}_partition_0_error_code"] = {"value": 0, "format": "H"}  # NO_ERROR
+                
                 _response[f"topic_{i}_partition_0_high_watermark"] = {"value": 1, "format": "Q"}
                 _response[f"topic_{i}_partition_0_last_stable_offset"] = {"value": 1, "format": "Q"}
                 _response[f"topic_{i}_partition_0_log_start_offset"] = {"value": 0, "format": "Q"}
                 _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}
                 _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
 
-                # Only include the RecordBatch if it exists and is non-empty
-                if record_batch_bytes and len(record_batch_bytes) > 0:
+                # Only include the RecordBatch if topic exists and file is non-empty
+                if topic_name is not None and record_batch_bytes and len(record_batch_bytes) > 0:
                     _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}  # 1 element
                     _response[f"topic_{i}_partition_0_records"] = {
                         "value": record_batch_bytes,
