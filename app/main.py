@@ -838,7 +838,7 @@ class Fetch(BaseBinaryHandler):
             topic_id = topic["topic_id"]
             topic_id_int = int.from_bytes(topic_id, byteorder="big")
 
-            # Get partition index
+            # Get partition index from the request
             if topic["partitions"]:
                 partition_index = topic["partitions"][0]["partition_index"]
             else:
@@ -847,55 +847,52 @@ class Fetch(BaseBinaryHandler):
             # Find topic name from metadata
             log = MetaDataLog(log_file)
             topic_name = None
-            print(f"DEBUG: Looking for topic UUID: {topic_id_int}")
+            
+            # Search for the topic name in metadata log
             for record_batch, _content in log.log.items():
                 for j in range(log.log[record_batch]["Records Length"]):
                     record = log.log[record_batch][f"Record #{j}"]
-                    print(f"DEBUG: Found record type {record['Value']['Type']} with UUID {record['Value'].get('Topic UUID', 'N/A')}")
                     if (
                         record["Value"]["Type"] == 2
                         and record["Value"]["Topic UUID"] == topic_id_int
                     ):
+                        # Convert the topic name from int to string
                         name_length = record["Value"]["Name_Length"]
                         topic_name_int = record["Value"]["Topic Name"]
-                        topic_name_bytes = topic_name_int.to_bytes(name_length - 1, "big")
-                        topic_name = topic_name_bytes.decode("utf-8", errors="ignore")
-                        print(f"DEBUG: Found matching topic: {topic_name}")
+                        try:
+                            # Convert int to bytes then decode to string
+                            topic_name_bytes = topic_name_int.to_bytes((name_length - 1), "big")
+                            topic_name = topic_name_bytes.decode("utf-8")
+                        except (ValueError, UnicodeDecodeError):
+                            # Fallback: treat as string if already decoded
+                            topic_name = str(topic_name_int)
                         break
                 if topic_name is not None:
                     break
 
-            print(f"DEBUG: Final topic_name: {topic_name}")
-            
-            # Try to read log file - FIXED VERSION
+            # Construct the correct log file path
             if topic_name:
-                log_path = f"/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
+                log_path = f"/tmp/kraft-combined-logs/{topic_name}-{partition_index}/00000000000000000000.log"
             else:
-                log_path = f"/kraft-combined-logs/None-{partition_index}/00000000000000000000.log"
+                # If topic not found, still try with partition index
+                log_path = f"/tmp/kraft-combined-logs/unknown-{partition_index}/00000000000000000000.log"
             
-            print(f"DEBUG: Trying to read from: {log_path}")  # Use the actual log_path variable
-            
-            # Debug: List what directories actually exist
-            import os
-            try:
-                dirs = os.listdir("/kraft-combined-logs/")
-                print(f"DEBUG: Available directories in /kraft-combined-logs/: {dirs}")
-            except Exception as e:
-                print(f"DEBUG: Cannot list /kraft-combined-logs/: {e}")
+            # Try to read the log file
+            record_batch_bytes = b""
+            message_count = 0
             
             try:
                 with open(log_path, "rb") as f:
                     record_batch_bytes = f.read()
-                print(f"DEBUG: Successfully read {len(record_batch_bytes)} bytes from log file")
-                message_count = 2 if len(record_batch_bytes) > 100 else 1
-            except Exception as e:
-                print(f"DEBUG: Failed to read log file: {e}")
+                message_count = 1 if len(record_batch_bytes) > 0 else 0
+            except FileNotFoundError:
+                # File doesn't exist - return empty records
                 record_batch_bytes = b""
                 message_count = 0
 
             # Topic response fields
             _response[f"topic_{i}_id"] = {"value": tuple(topic_id), "format": "16B"}
-            _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}
+            _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}  # 1 partition + 1 for compact array
 
             # Partition response fields  
             _response[f"topic_{i}_partition_0_index"] = {"value": partition_index, "format": "I"}
@@ -906,15 +903,15 @@ class Fetch(BaseBinaryHandler):
             _response[f"topic_{i}_partition_0_aborted_transactions_length"] = {"value": 1, "format": "B"}
             _response[f"topic_{i}_partition_0_preferred_read_replica"] = {"value": -1, "format": "i"}
 
-            # Records
+            # Records - include the entire RecordBatch from the log file
             if record_batch_bytes:
-                _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}
+                _response[f"topic_{i}_partition_0_records_length"] = {"value": 2, "format": "B"}  # 1 record + 1 for compact array
                 _response[f"topic_{i}_partition_0_records"] = {
                     "value": record_batch_bytes,
                     "format": f"{len(record_batch_bytes)}s",
                 }
             else:
-                _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}
+                _response[f"topic_{i}_partition_0_records_length"] = {"value": 1, "format": "B"}  # Empty array
 
             _response[f"topic_{i}_partition_0_tagged_fields"] = {"value": 0, "format": "B"}
             _response[f"topic_{i}_tagged_fields"] = {"value": 0, "format": "B"}
