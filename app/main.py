@@ -917,6 +917,18 @@ class Fetch(BaseBinaryHandler):
                     record_batch_bytes = b""
                     message_count = 0
 
+                # Add the missing topic_id and partition_index fields:
+                _response[f"topic_{i}_id"] = {"value": tuple(topic_id), "format": "16B"}
+                _response[f"topic_{i}_partitions_length"] = {"value": 2, "format": "B"}  # 1 element
+
+                _response[f"topic_{i}_partition_0_index"] = {"value": partition_index, "format": "I"}
+                
+                # Set error code based on whether topic was found
+                if topic_name is None:
+                    _response[f"topic_{i}_partition_0_error_code"] = {"value": 100, "format": "H"}  # UNKNOWN_TOPIC
+                else:
+                    _response[f"topic_{i}_partition_0_error_code"] = {"value": 0, "format": "H"}  # NO_ERROR
+                
                 # Set watermarks based on actual message count
                 if topic_name is not None and record_batch_bytes:
                     _response[f"topic_{i}_partition_0_high_watermark"] = {"value": message_count, "format": "Q"}
