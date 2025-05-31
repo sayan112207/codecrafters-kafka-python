@@ -877,8 +877,10 @@ class Fetch(BaseBinaryHandler):
             try:
                 with open(log_path, "rb") as f:
                     record_batch_bytes = f.read()
+                print(f"DEBUG: Successfully read {len(record_batch_bytes)} bytes from log file")
                 message_count = 2 if len(record_batch_bytes) > 100 else 1
-            except:
+            except Exception as e:
+                print(f"DEBUG: Failed to read log file: {e}")
                 record_batch_bytes = b""
                 message_count = 0
 
