@@ -873,7 +873,7 @@ class Fetch(BaseBinaryHandler):
             else:
                 log_path = f"/kraft-combined-logs/None-{partition_index}/00000000000000000000.log"
             
-            print(f"DEBUG: Corrected log_path: {log_path}")
+            print(f"DEBUG: Trying to read from: {log_path}")  # Use the actual log_path variable
             
             # Debug: List what directories actually exist
             import os
