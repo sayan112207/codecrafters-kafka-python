@@ -857,7 +857,13 @@ class Fetch(BaseBinaryHandler):
                         ):
                             # Convert topic_name from int to string
                             topic_name_int = record["Value"]["Topic Name"]
-                            topic_name = topic_name_int.to_bytes((topic_name_int.bit_length() + 7) // 8, 'big').decode(errors="ignore")
+                            if isinstance(topic_name_int, int):
+                                # Convert int to bytes, then decode
+                                length = (topic_name_int.bit_length() + 7) // 8
+                                topic_name = topic_name_int.to_bytes(length, 'big').decode('utf-8', errors='ignore')
+                            else:
+                                # Already bytes
+                                topic_name = topic_name_int.decode('utf-8', errors='ignore')
                             break
                     if topic_name is not None:
                         break
